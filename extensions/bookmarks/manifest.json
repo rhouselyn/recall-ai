@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Recall AI 书签同步",
+  "version": "0.2.0",
+  "description": "把当前资料档的书签树以只读方式交给本机 Recall 写入主机。",
+  "permissions": ["bookmarks", "storage", "alarms", "nativeMessaging"],
+  "background": { "service_worker": "service_worker.js" },
+  "options_ui": { "page": "options.html", "open_in_tab": false }
+}

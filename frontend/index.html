@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f7f5">
+  <title>Recall AI · 个人收藏工作台</title>
+  <link rel="icon" type="image/svg+xml" href="assets/recall.svg">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 11.5a7.7 7.7 0 0 1-8 7.5 9 9 0 0 1-3.1-.6L4 20l1.3-4.1A7 7 0 0 1 4 11.5 7.7 7.7 0 0 1 12 4a7.7 7.7 0 0 1 8 7.5Z"/><path d="M8.5 11.5h7"/></symbol>
+    <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6.5 5.5A1.5 1.5 0 0 1 8 4h8a1.5 1.5 0 0 1 1.5 1.5V20L12 16.5 6.5 20Z"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14l4-4m-5.5 6.5-1 1a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0m4 0 1-1a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0" transform="rotate(-8 12 12)"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4.5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-diagonal" viewBox="0 0 24 24"><path d="M6 18 18 6M8 6h10v10"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.75"/><path d="m15 15 4.5 4.5"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9.5 7h9M9.5 12h9M9.5 17h6m-11-10 1 1 2-2m-3 6 1 1 2-2m-3 6 1 1 2-2"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5.5" y="10" width="13" height="10" rx="2"/><path d="M8.5 10V7a3.5 3.5 0 0 1 7 0v3m-3.5 4v2"/></symbol>
+    <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 2.6a9.6 9.6 0 0 0-3.04 18.7c.48.08.65-.21.65-.46v-1.8c-2.67.58-3.24-1.13-3.24-1.13-.43-1.11-1.06-1.41-1.06-1.41-.87-.6.06-.58.06-.58.96.07 1.47.98 1.47.98.86 1.47 2.24 1.05 2.79.8.09-.62.34-1.05.62-1.29-2.13-.24-4.37-1.07-4.37-4.74 0-1.05.37-1.9.99-2.57-.1-.24-.43-1.22.09-2.55 0 0 .81-.26 2.64.98a9.2 9.2 0 0 1 4.8 0c1.83-1.24 2.63-.98 2.63-.98.53 1.33.2 2.31.1 2.55.61.67.98 1.52.98 2.57 0 3.68-2.24 4.49-4.38 4.73.35.3.65.88.65 1.78v2.66c0 .26.18.55.66.46A9.6 9.6 0 0 0 12 2.6Z"/></symbol>
+    <symbol id="i-chrome" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.6"/><path d="M4.2 7.4 9 14m3-5.6h8.3m-3.6 5.3-4.5 7.2"/></symbol>
+    <symbol id="i-bilibili" viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="17" height="12" rx="3"/><path d="m8 4 3 3.5M16 4l-3 3.5M8.5 12.5v2m7-2v2"/></symbol>
+    <symbol id="i-youtube" viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="14" rx="4"/><path d="m10 9 5 3-5 3z"/></symbol>
+    <symbol id="i-douyin" viewBox="0 0 24 24"><path d="M14 4v11.4a3.6 3.6 0 1 1-3.6-3.6M14 4c.4 3.5 2.3 5.1 5 5.3" stroke-width="2.4"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19 10a7.1 7.1 0 1 0 .2 4M19 5v5h-5"/></symbol>
+  </svg>
+
+  <aside class="sidebar" aria-label="工作区导航">
+    <a class="brand" href="#chat" aria-label="Recall AI 首页">
+      <img src="assets/recall.svg" alt="" width="42" height="42">
+      <span><strong>Recall<span> AI</span></strong><small>个人收藏工作台</small></span>
+    </a>
+    <button class="new-chat" id="new-chat" type="button"><svg class="icon"><use href="#i-plus"/></svg>新建对话</button>
+    <nav class="navigation">
+      <button type="button" class="nav-link" data-view="chat" aria-current="page"><svg class="icon"><use href="#i-chat"/></svg>对话</button>
+      <button type="button" class="nav-link" data-view="library"><svg class="icon"><use href="#i-bookmark"/></svg>收藏库</button>
+      <button type="button" class="nav-link" data-view="accounts"><svg class="icon"><use href="#i-link"/></svg>账号连接</button>
+    </nav>
+    <section class="history" aria-labelledby="history-title">
+      <h2 id="history-title">最近对话</h2>
+      <div id="history-list"></div>
+    </section>
+    <div class="sidebar-footer">
+      <span class="workspace-icon"><svg class="icon"><use href="#i-lock"/></svg></span>
+      <span><strong>我的工作区</strong><small>个人空间</small></span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="breadcrumb"><span>我的工作区</span><svg class="icon"><use href="#i-chevron"/></svg><strong id="current-view">对话</strong></div>
+      <span class="demo-badge"><span aria-hidden="true"></span>本地工作区</span>
+    </header>
+
+    <div class="content">
+      <section id="view-chat" aria-label="对话">
+        <div class="hero">
+          <div class="hero-copy">
+            <p class="hero-label"><span aria-hidden="true"></span>Recall AI</p>
+            <h1>把收藏变成知识</h1>
+            <p>找回零散的线索，串成今天用得上的答案。</p>
+          </div>
+          <div class="hero-index" aria-hidden="true"><i></i><i></i><i></i></div>
+        </div>
+
+        <div class="workgrid">
+          <section class="chat-section" aria-labelledby="chat-title">
+            <div class="section-heading">
+              <div><h2 id="chat-title">和收藏对话</h2><p>问一个问题，从你保存过的资料里找线索。</p></div>
+              <span class="quiet-icon" aria-hidden="true"><svg class="icon"><use href="#i-chat"/></svg></span>
+            </div>
+            <div class="suggestions" id="suggestions">
+              <button type="button" class="suggestion" data-prompt="我收藏过哪些关于日本市场的资料？">
+                <span class="suggestion-icon"><svg class="icon"><use href="#i-search"/></svg></span>
+                <span><strong>找回资料</strong><small>我收藏过哪些日本市场的资料？</small></span>
+                <svg class="icon hint-arrow"><use href="#i-diagonal"/></svg>
+              </button>
+              <button type="button" class="suggestion" data-prompt="把我收藏的 AI 工具整理成行动清单">
+                <span class="suggestion-icon sand"><svg class="icon"><use href="#i-list"/></svg></span>
+                <span><strong>整理下一步</strong><small>把 AI 工具收藏整理成行动清单</small></span>
+                <svg class="icon hint-arrow"><use href="#i-diagonal"/></svg>
+              </button>
+            </div>
+            <div class="messages" id="messages" role="log" aria-live="polite" hidden></div>
+            <form class="composer" id="composer">
+              <label class="sr-only" for="question">输入想问收藏的问题</label>
+              <textarea id="question" rows="2" maxlength="1500" placeholder="问问你的收藏…"></textarea>
+              <div class="composer-footer">
+                <label class="scope"><svg class="icon"><use href="#i-bookmark"/></svg><span class="sr-only">查询范围</span><select id="scope"><option value="">全部收藏</option></select><svg class="icon scope-arrow"><use href="#i-down"/></svg></label>
+                <button type="submit" class="send" aria-label="发送问题" title="发送问题"><svg class="icon"><use href="#i-send"/></svg></button>
+              </div>
+            </form>
+            <p class="chat-footnote">对话会将问题和相关收藏片段发送至 DeepSeek。点击引用查看来源。</p>
+          </section>
+
+          <aside class="account-panel" aria-labelledby="account-panel-title">
+            <div class="account-panel-head">
+              <div><h2 id="account-panel-title">收藏来源</h2><p id="connection-count"></p></div>
+              <span class="quiet-icon" aria-hidden="true"><svg class="icon"><use href="#i-link"/></svg></span>
+            </div>
+            <div id="account-summary"></div>
+            <button class="panel-action" type="button" data-view="accounts">管理所有账号<svg class="icon"><use href="#i-arrow"/></svg></button>
+          </aside>
+        </div>
+      </section>
+
+      <section id="view-library" hidden aria-labelledby="library-title">
+        <div class="page-heading">
+          <div><h1 id="library-title">收藏库</h1><p>浏览各个平台的收藏，按来源筛选或搜索标题。</p></div>
+          <span class="page-emblem" aria-hidden="true"><svg class="icon"><use href="#i-bookmark"/></svg></span>
+        </div>
+        <div class="library-controls">
+          <label class="search-field"><svg class="icon"><use href="#i-search"/></svg><span class="sr-only">搜索收藏</span><input id="library-query" type="search" placeholder="搜索标题、主题或收藏夹"></label>
+          <label class="filter-field"><span>来源</span><select id="library-source"><option value="">全部平台</option></select></label>
+        </div>
+        <div class="library-actions"><button type="button" class="secondary" id="add-link">添加链接</button><button type="button" class="secondary" id="import-file">导入收藏</button></div>
+        <p class="library-count" id="library-count" aria-live="polite"></p>
+        <div class="library-list" id="library-list"></div>
+      </section>
+
+      <section id="view-accounts" hidden aria-labelledby="accounts-title">
+        <div class="page-heading">
+          <div><h1 id="accounts-title">账号连接</h1><p>选择平台，查看本人收藏的授权方式和连接状态。</p></div>
+          <span class="page-emblem" aria-hidden="true"><svg class="icon"><use href="#i-link"/></svg></span>
+        </div>
+        <div class="account-note"><svg class="icon"><use href="#i-lock"/></svg><span>网页账号在本机浏览器中登录，收藏和会话保存在本地。</span></div>
+        <div class="account-list" id="account-list"></div>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="detail-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-inner">
+      <button type="button" class="icon-button dialog-close" id="dialog-close" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button>
+      <div id="dialog-content"></div>
+    </div>
+  </dialog>
+  <p class="toast" id="toast" role="status" hidden></p>
+</body>
+</html>

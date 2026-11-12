@@ -1,0 +1,18 @@
+# Python 环境与构建产物
+.venv/
+.mcp-test-lib/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# 本地个人数据与备份（开发规格 §8：不提交到仓库）
+.accept/
+.workbuddy/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+recall-backup*.db

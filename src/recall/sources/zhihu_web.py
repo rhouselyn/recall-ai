@@ -1,0 +1,146 @@
+"""知乎本人私密收藏夹（开发规格 §5.3 / R12）。
+
+自动发现依赖对已登录收藏页的实测，因此一期只读取用户显式登记的
+``/collection/<id>`` 已知夹；每次验证当前会话、夹归属和分页结束信号。
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from ..errors import RecallError
+from .base import Connector, FetchResult, check_budget, make_entry, require_session
+
+
+def parse_collection_items(payload: Any) -> tuple[list[dict[str, Any]], bool, int]:
+    if not isinstance(payload, dict) or "data" not in payload or not isinstance(payload.get("paging"), dict):
+        raise RecallError("SOURCE_FORMAT_CHANGED", "知乎收藏响应缺少数据或分页。")
+    data = payload.get("data") or []
+    if not isinstance(data, list):
+        raise RecallError("SOURCE_FORMAT_CHANGED", "知乎网页夹内响应格式变化。")
+    paging = (payload or {}).get("paging") or {}
+    items = []
+    for row in data:
+        content = row.get("content") or row
+        content_type = content.get("type") or row.get("type") or "content"
+        identifier = content.get("id") or row.get("id") or content.get("url")
+        url = content.get("url") or row.get("url")
+        question = content.get("question") or {}
+        if identifier and content_type == "answer" and question.get("id"):
+            url = f"https://www.zhihu.com/question/{question['id']}/answer/{identifier}"
+        elif identifier and content_type == "article":
+            url = f"https://zhuanlan.zhihu.com/p/{identifier}"
+        elif identifier and content_type == "question":
+            url = f"https://www.zhihu.com/question/{identifier}"
+        if not url:
+            items.append({"invalid": True})
+            continue
+        items.append(
+            {
+                "key": f"{content_type}:{identifier}",
+                "url": url,
+                "title": content.get("title") or question.get("title") or row.get("title"),
+                "excerpt": content.get("excerpt") or row.get("excerpt"),
+            }
+        )
+    is_end = bool(paging.get("is_end"))
+    from urllib.parse import parse_qs, urlsplit
+
+    next_value = paging.get("next") or paging.get("offset") or 0
+    if isinstance(next_value, str) and "://" in next_value:
+        next_value = parse_qs(urlsplit(next_value).query).get("offset", [0])[0]
+    try:
+        next_offset = int(next_value)
+    except (TypeError, ValueError) as exc:
+        raise RecallError("SOURCE_FORMAT_CHANGED", "知乎分页位置无效。") from exc
+    return items, is_end, next_offset
+
+
+class ZhihuWebConnector(Connector):
+    kind = "zhihu_web"
+    provider = "zhihu"
+    trusted = False
+
+    def fetch(
+        self,
+        mode: str = "head",
+        *,
+        state: dict[str, Any] | None = None,
+        budget: dict[str, Any] | None = None,
+    ) -> FetchResult:
+        session = require_session(self)
+        identity = session.identity()
+        me = session.get_json("/api/v4/me")
+        if not isinstance(me, dict) or not me.get("id"):
+            raise RecallError("AUTH_REQUIRED", "无法验证知乎登录身份。")
+        valid_ids = {str(value) for value in (me.get("id"), me.get("url_token")) if value}
+        if identity.get("user_id") and str(identity["user_id"]) not in valid_ids:
+            raise RecallError("ACCOUNT_MISMATCH", "知乎登录账号与填写的用户 ID 不一致。")
+        bound = self.config.get("account_id")
+        account_id = str(me["id"])
+        if bound and str(bound) != account_id:
+            raise RecallError("ACCOUNT_MISMATCH", "登录账号与已绑定来源不一致。")
+        collections = self.config.get("collections") or []
+        if not collections:
+            raise RecallError(
+                "PERMISSION_DENIED", "尚未登记已知私密收藏夹 ID，请先绑定 /collection/<id>。"
+            )
+        budget = dict(budget or {})
+        budget.setdefault("max_requests", 20)
+        result = FetchResult(coverage="authorized_subset", account_id=account_id)
+        max_pages = 1 if mode == "head" else int(budget.get("max_pages", 50))
+        pages = 0
+        finished = True
+        for collection in collections:
+            cid = str(collection.get("id") or collection.get("url_token") or "")
+            title = str(collection.get("title") or f"收藏夹 {cid}")
+            if not cid:
+                continue
+            metadata = session.get_json(f"/api/v4/collections/{cid}")
+            result.requests_used += 1
+            folder = metadata.get("collection", metadata) if isinstance(metadata, dict) else {}
+            creator = folder.get("creator") or {}
+            if not isinstance(creator, dict) or not creator.get("id"):
+                raise RecallError("SOURCE_FORMAT_CHANGED", "无法验证知乎收藏夹所有者。")
+            if str(creator["id"]) != account_id:
+                raise RecallError("PERMISSION_DENIED", "该知乎收藏夹不属于当前登录账号。")
+            offset = 0
+            seen: set[int] = set()
+            while True:
+                if offset in seen:
+                    raise RecallError("SOURCE_FORMAT_CHANGED", "知乎夹内分页循环。")
+                seen.add(offset)
+                if pages >= max_pages or not check_budget(result, budget):
+                    finished = False
+                    break
+                payload = session.get_json(
+                    f"/api/v4/collections/{cid}/items",
+                    params={"offset": offset, "limit": 20},
+                )
+                result.requests_used += 1
+                items, is_end, next_offset = parse_collection_items(payload)
+                for item in items:
+                    if item.get("invalid"):
+                        result.warnings.append("MISSING_CONTENT_URL")
+                        continue
+                    result.entries.append(
+                        make_entry(
+                            item["url"], title=item["title"], excerpt=item["excerpt"],
+                            path=(title,),
+                            external_key=f"collection:{cid}:{item['key']}",
+                            access="restricted", collection_access="restricted",
+                        )
+                    )
+                pages += 1
+                if is_end:
+                    break
+                if next_offset <= offset:
+                    result.warnings.append("MISSING_NEXT_OFFSET")
+                    finished = False
+                    break
+                offset = next_offset
+            if not finished and mode == "head":
+                break
+        result.complete = False  # 私密范围未自动枚举，保持子集标记
+        result.warnings.append("PRIVATE_FAVLISTS_NOT_DISCOVERED")
+        result.summary = f"{len(collections)} known collections / {pages} pages"
+        return result

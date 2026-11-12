@@ -1,0 +1,344 @@
+"""登录网页连接器共用的浏览器读取机制（开发规格 §5.5）。
+
+每个平台账号使用独立持久化配置目录；首次打开有界面浏览器由用户自行登录。
+同步进程只读取页面正常加载产生的网络响应或可见卡片，不执行写入操作。
+Playwright 是可选依赖；真人账号验收必须在用户自己的机器上进行。
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+from ..config import resolve_db_path
+from ..errors import RecallError
+
+PLATFORM_START = {
+    "zhihu_web": "https://www.zhihu.com/people/me/collections",
+    "bilibili_favorites": "https://space.bilibili.com/",
+    "xiaohongshu_favorites": "https://www.xiaohongshu.com/explore",
+    "douyin_favorites": "https://www.douyin.com/user/self",
+    "youtube_favorites": "https://www.youtube.com/",
+}
+
+
+def profile_dir(source_id: str, db_path: str | Path | None = None) -> Path:
+    root = resolve_db_path(db_path).parent / "browser-profiles"
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source_id)
+    return root / safe
+
+
+def _playwright():
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError as exc:
+        raise RecallError(
+            "CONFIG_ERROR", "登录网页连接器需要安装 playwright：python -m pip install -e '.[browser]'"
+        ) from exc
+    return sync_playwright
+
+
+def _launch(playwright: Any, directory: Path, *, headless: bool) -> Any:
+    try:
+        return playwright.chromium.launch_persistent_context(
+            str(directory), headless=headless, channel="chrome"
+        )
+    except Exception as exc:
+        if "not found" not in str(exc).lower() and "doesn't exist" not in str(exc).lower():
+            raise
+        return playwright.chromium.launch_persistent_context(str(directory), headless=headless)
+
+
+def connect(
+    source_id: str,
+    kind: str,
+    *,
+    wait_seconds: int = 180,
+    headless: bool = False,
+    user_id: str | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """首次连接：打开有界面浏览器让用户自行登录，登记资料档目录。"""
+    if kind not in PLATFORM_START:
+        raise RecallError("INVALID_ARGUMENT", "该来源类型不需要登录浏览器。")
+    directory = profile_dir(source_id, db_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    pw = _playwright()
+    with pw() as playwright:
+        context = _launch(playwright, directory, headless=headless)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(PLATFORM_START[kind], wait_until="domcontentloaded", timeout=30000)
+            deadline = time.monotonic() + min(max(wait_seconds, 1), 600)
+            while time.monotonic() < deadline and not page.is_closed():
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    if page.is_closed():
+                        break
+                    raise
+            identity = {"user_id": user_id or "", "label": source_id}
+            (directory / "identity.json").write_text(
+                json.dumps(identity, ensure_ascii=False), encoding="utf-8"
+            )
+            return {
+                "source_id": source_id,
+                "profile_dir": str(directory),
+                "identity": identity,
+                "note": "请在浏览器中确认已登录本人账号，随后执行 recall sync。",
+            }
+        finally:
+            context.close()
+
+
+def load_session(source_id: str, kind: str, db_path: str | Path | None = None) -> "PlaywrightBrowserSession":
+    directory = profile_dir(source_id, db_path)
+    if not (directory / "identity.json").is_file():
+        raise RecallError("AUTH_REQUIRED", "尚未执行 recall source connect。")
+    pw = _playwright()
+    playwright = pw().start()
+    context = None
+    try:
+        context = _launch(playwright, directory, headless=True)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(PLATFORM_START[kind], wait_until="domcontentloaded", timeout=30000)
+        return PlaywrightBrowserSession(page, playwright, context, directory)
+    except Exception:
+        if context is not None:
+            context.close()
+        playwright.stop()
+        raise
+
+
+class PlaywrightBrowserSession:
+    """实现 sources.base.BrowserSession；读取在页面上下文中完成。"""
+
+    def __init__(self, page: Any, playwright: Any, context: Any, directory: Path) -> None:
+        self.page = page
+        self._playwright = playwright
+        self._context = context
+        self._directory = directory
+        self._douyin_started = False
+        self._xhs_started = False
+
+    def close(self) -> None:
+        self._context.close()
+        self._playwright.stop()
+
+    def youtube_playlists(self) -> tuple[str, list[dict[str, str]]]:
+        import hashlib
+        import re
+        from urllib.parse import parse_qs, urlsplit
+
+        try:
+            self.page.goto("https://www.youtube.com/feed/playlists", wait_until="domcontentloaded", timeout=30000)
+            self.page.locator("#avatar-btn").first.click(timeout=15000)
+            self.page.wait_for_timeout(1000)
+            account = self.page.evaluate("""() => {
+                const header = document.querySelector('ytd-active-account-header-renderer');
+                return header?.querySelector('#email')?.textContent?.trim()
+                    || header?.querySelector('#channel-handle')?.textContent?.trim() || '';
+            }""")
+            if not account:
+                raise RecallError("AUTH_REQUIRED", "无法确认 YouTube 登录账号，请重新连接。")
+            self.page.keyboard.press("Escape")
+            found = [{"id": "WL", "title": "稍后观看"}, {"id": "LL", "title": "喜欢的视频"}]
+            seen = {"WL", "LL"}
+            # shortcut: 页面只发现当前滚动加载的播放列表，平台分页协议稳定后再扩大覆盖。
+            unchanged = 0
+            for _ in range(30):
+                before = len(seen)
+                links = self.page.locator('a[href*="list="]').evaluate_all(
+                    "nodes => nodes.map(n => ({href:n.href, title:n.title || n.innerText || n.getAttribute('aria-label') || ''}))")
+                for link in links:
+                    values = parse_qs(urlsplit(link.get("href", "")).query).get("list", [])
+                    value = values[0] if values else ""
+                    if re.fullmatch(r"[A-Za-z0-9_-]{2,128}", value) and value not in seen:
+                        seen.add(value)
+                        found.append({"id": value, "title": str(link.get("title") or "播放列表").strip()[:200] or "播放列表"})
+                self.page.mouse.wheel(0, 2500)
+                self.page.wait_for_timeout(500)
+                unchanged = unchanged + 1 if len(seen) == before else 0
+                if unchanged >= 3:
+                    break
+            return hashlib.sha256(account.lower().encode()).hexdigest(), found
+        except RecallError:
+            raise
+        except Exception as exc:
+            raise RecallError("AUTH_REQUIRED", "无法读取 YouTube 登录页面，请检查网络并重新登录。") from exc
+
+    def youtube_playlist(self, playlist_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        import http.cookiejar
+        import re
+        try:
+            import yt_dlp
+        except ImportError as exc:
+            raise RecallError("CONFIG_ERROR", "YouTube 连接器需要安装：python -m pip install -e '.[youtube]'。") from exc
+        if not re.fullmatch(r"[A-Za-z0-9_-]{2,128}", playlist_id):
+            raise RecallError("INVALID_ARGUMENT", "无效的 YouTube 播放列表。")
+        options: dict[str, Any] = {"extract_flat": True, "skip_download": True, "quiet": True,
+                                  "no_warnings": True, "socket_timeout": 20, "retries": 1}
+        if limit:
+            options["playlistend"] = limit
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                jar = downloader.cookiejar
+                for cookie in self._context.cookies(["https://www.youtube.com", "https://www.google.com"]):
+                    domain = cookie["domain"]
+                    jar.set_cookie(http.cookiejar.Cookie(
+                        version=0, name=cookie["name"], value=cookie["value"], port=None,
+                        port_specified=False, domain=domain, domain_specified=domain.startswith("."),
+                        domain_initial_dot=domain.startswith("."), path=cookie.get("path", "/"),
+                        path_specified=True, secure=cookie.get("secure", False),
+                        expires=int(cookie["expires"]) if cookie.get("expires", -1) > 0 else None,
+                        discard=cookie.get("expires", -1) <= 0, comment=None, comment_url=None,
+                        rest={}, rfc2109=False))
+                info = downloader.extract_info("https://www.youtube.com/playlist?list=" + playlist_id, download=False)
+                if not isinstance(info, dict) or info.get("entries") is None:
+                    raise RecallError("SOURCE_FORMAT_CHANGED", "YouTube 播放列表响应格式变化。")
+                return [entry for entry in info["entries"] if isinstance(entry, dict)]
+        except RecallError:
+            raise
+        except Exception as exc:
+            raise RecallError("NETWORK_ERROR", "无法读取 YouTube 播放列表，请检查网络、登录和播放列表权限。") from exc
+
+    def identity(self) -> dict[str, Any]:
+        try:
+            identity = json.loads((self._directory / "identity.json").read_text(encoding="utf-8"))
+            if "xiaohongshu.com" in self.page.url or "rednote.com" in self.page.url:
+                state_user = self.page.evaluate("""() => {
+                    const u = globalThis.__INITIAL_STATE__?.user || {};
+                    const ui = u.userInfo?._rawValue || u.userInfo || {};
+                    const loggedIn = u.loggedIn?._rawValue ?? u.loggedIn;
+                    return { loggedIn: !!loggedIn, userId: ui.userId || ui.user_id || '' };
+                }""")
+                actual = str(state_user.get("userId") or "") if isinstance(state_user, dict) else ""
+                if not actual:
+                    from urllib.parse import urlsplit
+                    import re
+                    href = self.page.evaluate("""() => document.querySelector(
+                        'header a[href^="/user/profile/"], .user.side-bar-component a[href^="/user/profile/"]'
+                        )?.getAttribute('href') || ''""")
+                    match = re.search(r"/user/profile/([^/?#]+)", urlsplit(href).path)
+                    if not match:
+                        raise RecallError("AUTH_REQUIRED", "无法确认小红书登录账号，请重新登录。")
+                    actual = match.group(1)
+                if identity.get("user_id") and identity["user_id"] != actual:
+                    raise RecallError("ACCOUNT_MISMATCH", "小红书登录账号与填写的用户 ID 不一致。")
+                identity["user_id"] = actual
+            return identity
+        except (OSError, ValueError) as exc:
+            raise RecallError("AUTH_REQUIRED", "登录身份不可用，请重新连接。") from exc
+
+    def status(self) -> str:
+        try:
+            url = self.page.url
+            title = self.page.title()
+        except Exception:
+            return "expired"
+        if "login" in url.lower() or "passport" in url.lower():
+            return "login_required"
+        if "验证" in title or "captcha" in url.lower():
+            return "captcha"
+        return "ok"
+
+    def get_json(self, url: str, *, params: dict[str, Any] | None = None) -> Any:
+        from urllib.parse import urlencode, urlsplit
+
+        target = url if url.startswith("http") else self.page.url.split("/")[0] + "//" + self.page.url.split("/")[2] + url
+        if params:
+            target += ("&" if "?" in target else "?") + urlencode(params)
+        path = urlsplit(target).path
+        if "douyin.com" in target and path == "/aweme/v1/web/aweme/listcollection/":
+            return self._douyin_collection()
+        if ("xiaohongshu.com" in target or "rednote.com" in target) and path == "/api/sns/web/v2/note/collect/page":
+            return self._xhs_collection(params or {})
+        script = """async (u) => {
+            const r = await fetch(u, {credentials: 'include'});
+            if (!r.ok) return {__status: r.status};
+            return await r.json();
+        }"""
+        payload = self.page.evaluate(script, target)
+        if isinstance(payload, dict) and "__status" in payload:
+            status = int(payload["__status"])
+            if status in (401, 403):
+                raise RecallError("AUTH_REQUIRED", "页面会话无权限，请重新连接。")
+            if status == 429:
+                raise RecallError("RATE_LIMITED", "页面请求被限流。")
+            raise RecallError("NETWORK_ERROR", "页面响应异常。")
+        if isinstance(payload, dict):
+            if payload.get("success") is False or payload.get("status_code", 0) not in (0, None):
+                raise RecallError("PERMISSION_DENIED", "平台拒绝读取收藏，请在浏览器确认登录和权限。")
+            if "bilibili.com" in target and payload.get("code", 0) != 0:
+                raise RecallError("PERMISSION_DENIED", "B 站拒绝读取收藏，请确认登录状态。")
+        return payload
+
+    def _douyin_collection(self) -> Any:
+        try:
+            with self.page.expect_response(
+                lambda response: "/aweme/v1/web/aweme/listcollection/" in response.url,
+                timeout=20000,
+            ) as captured:
+                if not self._douyin_started:
+                    self.page.goto("https://www.douyin.com/user/self", wait_until="domcontentloaded")
+                    tab = self.page.get_by_role("tab", name="收藏", exact=True)
+                    if tab.get_attribute("aria-selected") != "true":
+                        tab.click()
+                    videos = self.page.get_by_role("tab", name="视频", exact=True)
+                    if videos.get_attribute("aria-selected") != "true":
+                        videos.click()
+                    self._douyin_started = True
+                else:
+                    self.page.mouse.wheel(0, 2400)
+            response = captured.value
+            if not response.ok:
+                raise RecallError("PERMISSION_DENIED", "抖音收藏页面拒绝访问。")
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("status_code", 0) != 0:
+                raise RecallError("PERMISSION_DENIED", "抖音收藏页面返回错误。")
+            return payload
+        except RecallError:
+            raise
+        except Exception as exc:
+            raise RecallError("SOURCE_FORMAT_CHANGED", "无法读取抖音收藏页面，请检查登录或页面验证。") from exc
+
+    def _xhs_collection(self, params: dict[str, Any]) -> Any:
+        from urllib.parse import quote
+        try:
+            cursor = int(params.get("cursor") or 0)
+            if not self._xhs_started:
+                user_id = self.identity().get("user_id")
+                if not user_id:
+                    raise RecallError("AUTH_REQUIRED", "无法确认小红书登录账号。")
+                target = "https://www.rednote.com/user/profile/" + quote(user_id, safe="") + "?tab=fav&subTab=note"
+                self.page.goto(target, wait_until="domcontentloaded", timeout=30000)
+                self._xhs_started = True
+            else:
+                self.page.mouse.wheel(0, 2400)
+            self.page.wait_for_timeout(1500)
+            raw = self.page.evaluate("() => globalThis.__INITIAL_STATE__?.user?.notes?._rawValue?.[1] ?? null")
+            if not isinstance(raw, list):
+                raise RecallError("SOURCE_FORMAT_CHANGED", "无法读取小红书收藏页面数据。")
+            notes = []
+            for item in raw[cursor:]:
+                if not isinstance(item, dict) or not isinstance(item.get("noteCard"), dict):
+                    continue
+                card = item["noteCard"]
+                notes.append({
+                    "note_id": item.get("id") or item.get("noteId") or card.get("noteId"),
+                    "display_title": card.get("displayTitle") or card.get("title"),
+                    "type": card.get("type"),
+                    "xsec_token": item.get("xsecToken") or card.get("xsecToken"),
+                })
+            return {"data": {"notes": notes, "cursor": str(len(raw)), "has_more": len(raw) > cursor}}
+        except RecallError:
+            raise
+        except Exception as exc:
+            raise RecallError("SOURCE_FORMAT_CHANGED", "无法读取小红书收藏页面，请检查登录或页面验证。") from exc
+
+    def visible_cards(self, selector: str) -> list[dict[str, Any]]:
+        return self.page.locator(selector).evaluate_all(
+            "(nodes) => nodes.map(n => ({title: n.innerText, href: n.getAttribute('href')}))"
+        )

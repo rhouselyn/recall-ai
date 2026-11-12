@@ -1,0 +1,8 @@
+﻿url,title,collection,saved_at,note,access
+https://user:password@example.com/private,带用户名密码,示例,,,standard
+https://example.com/ok?utm_source=mail&keep=1,清理跟踪参数,示例,,,standard
+ftp://example.com/file,非 http 协议,示例,,,standard
+,缺 URL,示例,,,standard
+https://example.com/bad-time,时间格式错,示例,not-a-time,,standard
+https://example.com/bad-access,权限值错,示例,,,unknown
+https://example.com/fine,正常行,示例,2026-10-01T00:00:00Z,,restricted
