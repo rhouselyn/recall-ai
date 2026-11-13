@@ -5,6 +5,7 @@ ETag / Last-Modified 条件请求；304 只更新时间检查字段。
 """
 from __future__ import annotations
 
+import json
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -71,8 +72,12 @@ class RssConnector(Connector):
         headers: dict[str, str] = {}
         if state.get("last_etag"):
             headers["If-None-Match"] = state["last_etag"]
-        if state.get("last_modified"):
-            headers["If-Modified-Since"] = state["last_modified"]
+        try:
+            last_modified = json.loads(state.get("last_summary") or "{}").get("text")
+        except (TypeError, ValueError, AttributeError):
+            last_modified = None
+        if last_modified:
+            headers["If-Modified-Since"] = last_modified
         result = FetchResult(coverage="authorized_subset")
         if not check_budget(result, budget):
             raise RecallError("RATE_LIMITED", "RSS 请求预算用尽。")

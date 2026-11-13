@@ -10,7 +10,6 @@ import csv
 import io
 import json
 import re
-import unicodedata
 from dataclasses import dataclass, field, replace as dataclass_replace
 from html import unescape
 from html.parser import HTMLParser
@@ -27,7 +26,6 @@ from .urls import (
     MAX_TITLE_LENGTH,
     MAX_TEXT_LENGTH,
     MAX_URL_LENGTH,
-    SafeUrl,
     UrlProblem,
     sanitize_url,
     saved_at_iso,
@@ -181,6 +179,7 @@ class _BookmarkHTMLParser(HTMLParser):
         self.current_h3: str | None = None
         self.in_script = 0
         self.unclosed_tag = False
+        self.invalid_structure = False
         self.links: list[dict[str, Any]] = []
         self.folders: set[tuple[str, ...]] = set()
 
@@ -196,6 +195,8 @@ class _BookmarkHTMLParser(HTMLParser):
             return
         if self.in_script:
             return
+        if tag in ("dl", "h3", "a") and (self.current_a is not None or self.current_h3 is not None):
+            self.invalid_structure = True
         if tag == "dl":
             self.saw_dl = True
             self.dl_depth += 1
@@ -253,10 +254,14 @@ class _BookmarkHTMLParser(HTMLParser):
         if tag == "dl":
             if self.dl_depth > 0:
                 self.dl_depth -= 1
+            else:
+                self.invalid_structure = True
             if self.stack:
                 self.stack.pop()
             return
         if tag == "h3":
+            if self.current_h3 is None:
+                self.invalid_structure = True
             name = (self.current_h3 or "").strip()
             if name:
                 self.pending_folder = name
@@ -265,6 +270,8 @@ class _BookmarkHTMLParser(HTMLParser):
             self.unclosed_tag = False
             return
         if tag == "a":
+            if self.current_a is None:
+                self.invalid_structure = True
             if self.current_a is not None:
                 self.saw_link = True
                 self.links.append(self.current_a)
@@ -284,7 +291,7 @@ def _parse_bookmarks_html(text: str) -> _BookmarkHTMLParser:
         raise RecallError("INVALID_ARGUMENT", "书签 HTML 结构损坏。") from exc
     if not parser.saw_dl:
         raise RecallError("INVALID_ARGUMENT", "书签 HTML 缺少目录结构。")
-    if parser.dl_depth != 0 or parser.unclosed_tag or parser.current_a is not None:
+    if parser.invalid_structure or parser.dl_depth != 0 or parser.unclosed_tag or parser.current_a is not None:
         raise RecallError("INVALID_ARGUMENT", "书签 HTML 疑似截断，目录未闭合。")
     if not re.search(r"</DL>\s*(?:<p>\s*)?$", text[-256:], re.IGNORECASE):
         raise RecallError("INVALID_ARGUMENT", "书签 HTML 尾部不完整，疑似截断。")
@@ -393,7 +400,7 @@ def import_bookmarks_html(
 # --------------------------------------------------------------------------
 
 
-def _csv_rows(text: str, ctx: _ImportContext) -> tuple[list[dict[str, str]], list[RowError]]:
+def _csv_rows(text: str, ctx: _ImportContext) -> list[tuple[int, dict[str, str]]]:
     reader = csv.DictReader(io.StringIO(text, newline=""))
     header = reader.fieldnames
     if not header:
@@ -403,17 +410,18 @@ def _csv_rows(text: str, ctx: _ImportContext) -> tuple[list[dict[str, str]], lis
         raise RecallError("INVALID_ARGUMENT", "CSV 缺少必填列 url。")
     if len(set(names)) != len(names) or set(names) - CSV_COLUMNS:
         raise RecallError("INVALID_ARGUMENT", "CSV 表头含重复列或未知列。")
-    rows: list[dict[str, str]] = []
+    reader.fieldnames = names
+    rows: list[tuple[int, dict[str, str]]] = []
     for raw in reader:
         line = reader.line_num
         if raw.get(None) is not None:
             ctx.row_errors.append(RowError(line, "ROW_TOO_WIDE"))
             ctx.counts["skipped_rows"] += 1
             continue
-        rows.append({key: (value or "").strip() for key, value in raw.items() if key})
+        rows.append((line, {key: (value or "").strip() for key, value in raw.items() if key}))
         if len(rows) > MAX_ITEMS_PER_IMPORT:
             raise RecallError("INVALID_ARGUMENT", "CSV 条目超过单次导入上限。")
-    return rows, ctx.row_errors
+    return rows
 
 
 def import_csv(
@@ -428,7 +436,7 @@ def import_csv(
         raise RecallError("INVALID_ARGUMENT", "CSV 只支持增量合并，不支持替换。")
     ctx = _ImportContext(source_id)
     text = _read_file(file_path, ctx)
-    rows, _ = _csv_rows(text, ctx)
+    rows = _csv_rows(text, ctx)
     conn = open_readwrite(db_path)
     coverage = "imported_subset"
     run_id = catalog.start_run(conn, source_id, "file", coverage)
@@ -436,7 +444,7 @@ def import_csv(
         catalog.ensure_source(conn, source_id, "manual", platform, coverage=coverage)
         entries: list[catalog.EntryInput] = []
         folder_paths: set[tuple[str, ...]] = set()
-        for line, row in enumerate(rows, start=2):
+        for line, row in rows:
             raw_url = row.get("url", "")
             if not raw_url:
                 ctx.row_errors.append(RowError(line, "MISSING_URL"))
@@ -561,26 +569,44 @@ def _tree_paths(nodes: Sequence[dict[str, Any]]) -> tuple[dict[str, tuple[str, .
     目录路径包含自身标题（用于子节点），书签的收藏路径只到父目录，
     不能把书签自己的标题当成夹名。
     """
-    by_id = {str(node.get("id")): node for node in nodes}
+    by_id = {}
+    for node in nodes:
+        if (not isinstance(node, dict) or not isinstance(node.get("id"), str)
+                or not node["id"] or node["id"] in by_id
+                or any(not isinstance(node.get(key, ""), str) for key in ("parentId", "title", "url"))):
+            raise RecallError("INVALID_ARGUMENT", "书签节点格式无效或 ID 重复。")
+        by_id[node["id"]] = node
+    for node_id, node in by_id.items():
+        parent = node.get("parentId", "")
+        if ((not parent and node_id != "0") or (parent and parent not in by_id)
+                or (parent and by_id[parent].get("url"))):
+            raise RecallError("INVALID_ARGUMENT", "书签父目录缺失或无效。")
     own_paths: dict[str, tuple[str, ...]] = {}
     folders: set[tuple[str, ...]] = set()
 
-    def compute(node_id: str, seen: frozenset[str] = frozenset()) -> tuple[str, ...]:
-        if node_id in own_paths:
-            return own_paths[node_id]
-        if node_id in seen:
-            return ()
-        node = by_id.get(node_id)
-        if node is None:
-            return ()
-        parent = str(node.get("parentId") or "")
-        parent_path = compute(parent, seen | {node_id}) if parent and parent != "0" else ()
-        title = str(node.get("title") or "").strip()
-        own = parent_path + ((title,) if title else ())
-        own_paths[node_id] = own
-        if not node.get("url"):
-            folders.add(own)
-        return own
+    def compute(node_id: str) -> tuple[str, ...]:
+        chain: list[str] = []
+        seen: set[str] = set()
+        current = node_id
+        while current and current not in own_paths:
+            if current in seen:
+                raise RecallError("INVALID_ARGUMENT", "书签目录包含循环。")
+            seen.add(current)
+            chain.append(current)
+            if len(chain) > 256:
+                raise RecallError("INVALID_ARGUMENT", "书签目录嵌套过深。")
+            current = by_id[current].get("parentId", "")
+        path = own_paths.get(current, ())
+        for current in reversed(chain):
+            node = by_id[current]
+            title = node.get("title", "").strip() if current != "0" else ""
+            path = path + ((title,) if title else ())
+            if len(path) > 256:
+                raise RecallError("INVALID_ARGUMENT", "书签目录嵌套过深。")
+            own_paths[current] = path
+            if not node.get("url"):
+                folders.add(path)
+        return own_paths[node_id]
 
     entry_paths: dict[str, tuple[str, ...]] = {}
     for node in nodes:
@@ -591,6 +617,8 @@ def _tree_paths(nodes: Sequence[dict[str, Any]]) -> tuple[dict[str, tuple[str, .
             entry_paths[node_id] = (
                 compute(parent) if parent and parent != "0" else ()
             )
+        else:
+            entry_paths[node_id] = own_paths[node_id]
     return entry_paths, folders
 
 
@@ -617,9 +645,16 @@ def import_bookmark_tree(
         return failed("INVALID_ARGUMENT", "节点数量无效或超过上限。")
     if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_FILE_BYTES:
         return failed("INVALID_ARGUMENT", "消息超过大小上限。")
+    if not isinstance(payload.get("accept_empty", False), bool):
+        return failed("INVALID_ARGUMENT", "空快照确认必须是布尔值。")
+    try:
+        paths, folder_paths = _tree_paths(nodes)
+    except RecallError as exc:
+        return failed(exc.code, exc.message)
 
     conn = open_readwrite(db_path)
     try:
+        conn.execute("BEGIN IMMEDIATE")
         source = catalog.get_source(conn, source_id)
         config = json.loads(source["config_json"]) if source else {}
         if source is None:
@@ -648,7 +683,6 @@ def import_bookmark_tree(
             return failed("STALE_CURSOR", "旧版本快照不能覆盖更新的目录。")
 
         ctx = _ImportContext(source_id)
-        paths, folder_paths = _tree_paths(nodes)
         entries: list[catalog.EntryInput] = []
         for node in nodes:
             raw_url = str(node.get("url") or "").strip()
@@ -676,14 +710,23 @@ def import_bookmark_tree(
             )
             if entry is not None:
                 entries.append(
-                    dataclass_replace(entry, external_key=f"node:{profile}:{node_id}")
+                    dataclass_replace(entry, external_key=f"node:{profile}:{node_id}",
+                                      collection_key=f"folder:{profile}:{node.get('parentId', '0')}")
                 )
         if not entries and not bool(payload.get("accept_empty", False)) and int(previous) > 0:
             return failed("SNAPSHOT_INCOMPLETE", "异常空快照，旧目录已保留。")
 
         run_id = catalog.start_run(conn, source_id, "event", "live_profile")
         with catalog.transaction(conn):
-            _ensure_collections(conn, source_id, folder_paths, ctx)
+            catalog.migrate_legacy_collections(conn, source_id, entries)
+            for node in nodes:
+                if not node.get("url"):
+                    key, created = catalog.ensure_collection(
+                        conn, source_id, paths.get(str(node["id"]), ()),
+                        external_key=f"folder:{profile}:{node['id']}",
+                    )
+                    ctx.collections.add(key)
+                    ctx.counts["collections_added"] += int(created)
             result = catalog.replace_snapshot(
                 conn, source_id, entries,
                 allow_empty=bool(payload.get("accept_empty", False)),
@@ -699,6 +742,7 @@ def import_bookmark_tree(
         report = ctx.finish(result, "succeeded", "live_profile", run_id)
         counts = report["counts"]
         catalog.finish_run(conn, run_id, "succeeded", counts=counts, coverage="live_profile")
+        conn.execute("COMMIT")
         return {
             "ok": True, "version": version, "source_id": source_id,
             "counts": counts, "catalog_version": result.catalog_version,
@@ -708,4 +752,6 @@ def import_bookmark_tree(
     except Exception:
         return failed("INTERNAL_ERROR", "写入失败，旧目录已保留。")
     finally:
+        if conn.in_transaction:
+            conn.rollback()
         conn.close()

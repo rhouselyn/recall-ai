@@ -35,6 +35,13 @@ def resolve_db_path(path: str | os.PathLike[str] | None = None) -> Path:
     return Path(path).expanduser() if path is not None else default_db_path()
 
 
+def media_dir(db_path: str | os.PathLike[str] | None = None) -> Path:
+    import hashlib
+    database = resolve_db_path(db_path).resolve()
+    key = hashlib.sha256(os.path.normcase(str(database)).encode()).hexdigest()
+    return database.parent / "media" / key
+
+
 def allowed_sources_from_env() -> frozenset[str] | None:
     """返回 None 表示未配置；空字符串视为显式配置成空集合。"""
     raw = os.environ.get(ALLOWED_SOURCES_ENV)
@@ -45,7 +52,3 @@ def allowed_sources_from_env() -> frozenset[str] | None:
 
 def include_restricted_from_env() -> bool:
     return os.environ.get(INCLUDE_RESTRICTED_ENV) == "1"
-
-
-def clock_env(name: str, default: str | None = None) -> str | None:
-    return os.environ.get(name, default)

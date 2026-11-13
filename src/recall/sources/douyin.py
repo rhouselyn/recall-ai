@@ -66,11 +66,12 @@ class DouyinFavoritesConnector(Connector):
         if not identity.get("user_id") and not identity.get("sec_uid"):
             raise RecallError("AUTH_REQUIRED", "无法确认当前登录身份。")
         bound = self.config.get("account_id")
-        if bound and str(bound) != str(identity.get("user_id") or identity.get("sec_uid")):
+        if bound and str(bound) not in {str(identity.get("user_id")), str(identity.get("sec_uid"))}:
             raise RecallError("ACCOUNT_MISMATCH", "登录账号与已绑定来源不一致。")
         budget = dict(budget or {})
         budget.setdefault("max_requests", 20)
-        result = FetchResult(coverage="authorized_subset")
+        result = FetchResult(coverage="authorized_subset",
+                             account_id=str(identity.get("user_id") or identity.get("sec_uid")))
         max_pages = 1 if mode == "head" else int(budget.get("max_pages", 30))
         cursor = ""
         seen: set[str] = set()
@@ -91,7 +92,7 @@ class DouyinFavoritesConnector(Connector):
             for aweme in awemes:
                 result.entries.append(
                     make_entry(
-                        aweme["url"], title=aweme["title"], path=("收藏",),
+                        aweme["url"], title=aweme["title"], path=("收藏",), collection_key="douyin:favorites",
                         external_key=aweme["key"], note=f"type={aweme['type']}",
                         access="restricted", collection_access="restricted",
                     )
@@ -118,7 +119,7 @@ class DouyinFavoritesConnector(Connector):
                     result.entries.append(
                         make_entry(
                             aweme["url"], title=aweme["title"],
-                            path=("收藏分组", group["name"]),
+                            path=("收藏分组", group["name"]), collection_key=f"douyin:group:{group['id']}",
                             external_key=f"collects:{group['id']}:{aweme['key']}",
                             access="restricted", collection_access="restricted",
                         )

@@ -9,12 +9,13 @@ import base64
 import hashlib
 import json
 import sqlite3
+from functools import wraps
 from typing import Any, Iterable, Sequence
 
 from . import catalog
 from .db import catalog_version, open_readonly
 from .errors import RecallError
-from .textnorm import DEFAULT_LIMIT, MAX_LIMIT, like_literal, normalize, query_words
+from .textnorm import DEFAULT_LIMIT, MAX_LIMIT, like_literal, query_words
 from .urls import display_title, saved_at_iso
 
 PLATFORMS = frozenset(
@@ -24,11 +25,25 @@ SEGMENT_LABELS = {"ocr": "图片识别", "asr": "音频转写", "caption": "平�
 MAX_SEARCH_SOURCES = 3
 MAX_SNIPPETS = 3
 MAX_EVIDENCE_SEGMENTS = 5
+_TIME_PUNCTUATION = str.maketrans("", "", "-T:Z")
 
 
-def _desc_time(value: str | None) -> tuple[int, ...]:
+def _read_snapshot(method):
+    @wraps(method)
+    def read(self, *args, **kwargs):
+        if self.conn.in_transaction:
+            return method(self, *args, **kwargs)
+        self.conn.execute("BEGIN")
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.conn.execute("ROLLBACK")
+    return read
+
+
+def _desc_time(value: str | None) -> int:
     """把 UTC RFC 3339 字符串翻成可升序排列的「倒序」键。"""
-    return tuple(-ord(ch) for ch in (value or ""))
+    return -int(value.translate(_TIME_PUNCTUATION)) if value else 0
 
 
 def _encode(payload: dict[str, Any]) -> str:
@@ -58,8 +73,8 @@ def _as_source_ids(value: Any) -> list[str] | None:
         return None
     if isinstance(value, str):
         ids = [part.strip() for part in value.split(",") if part.strip()]
-    elif isinstance(value, Iterable):
-        ids = [str(part).strip() for part in value if str(part).strip()]
+    elif isinstance(value, (list, tuple, set, frozenset)) and all(isinstance(part, str) for part in value):
+        ids = [part.strip() for part in value if part.strip()]
     else:
         raise RecallError("INVALID_ARGUMENT", "source_ids 必须是字符串列表。")
     if len(set(ids)) > 50:
@@ -168,6 +183,8 @@ class RecallTools:
                 raise RecallError("NOT_FOUND")
 
     def _assert_collection(self, collection_id: str) -> None:
+        if not isinstance(collection_id, str) or not collection_id:
+            raise RecallError("INVALID_ARGUMENT", "collection_id 无效。")
         scope, params = self._collection_scope_sql()
         row = self.conn.execute(
             "SELECT c.collection_id FROM collections c WHERE c.collection_id = ? AND " + scope,
@@ -225,6 +242,7 @@ class RecallTools:
         return page, offset + limit < len(rows)
 
     # -- 工具 1 -----------------------------------------------------------
+    @_read_snapshot
     def recall_list_sources(self) -> dict[str, Any]:
         sources = catalog.list_sources(
             self.conn, self.allowed_sources,
@@ -238,6 +256,7 @@ class RecallTools:
         }
 
     # -- 工具 2 -----------------------------------------------------------
+    @_read_snapshot
     def recall_list_collections(
         self,
         source_id: str | None = None,
@@ -287,6 +306,7 @@ class RecallTools:
         }
 
     # -- 工具 3 -----------------------------------------------------------
+    @_read_snapshot
     def recall_search(
         self,
         query: str | None = None,
@@ -305,7 +325,7 @@ class RecallTools:
             raise RecallError("INVALID_ARGUMENT", "query 超过长度或词数限制。") from exc
         ids = _as_source_ids(source_ids)
         self._assert_source_ids(ids)
-        if platform is not None and platform not in PLATFORMS:
+        if platform is not None and (not isinstance(platform, str) or platform not in PLATFORMS):
             raise RecallError("INVALID_ARGUMENT", f"未知内容平台：{platform}")
         if collection_id is not None:
             self._assert_collection(collection_id)
@@ -316,12 +336,12 @@ class RecallTools:
             raise RecallError("INVALID_ARGUMENT", "时间过滤必须是 UTC 或带时区的时间。") from exc
 
         filters = {
-            "query": query, "source_ids": sorted(ids) if ids else None,
+            "query": query, "source_ids": sorted(set(ids)) if ids is not None else None,
             "platform": platform, "collection_id": collection_id,
             "saved_after": after, "saved_before": before,
         }
         offset = self._offset("recall_search", filters, cursor)
-        rows = self._matched_rows(words, ids, platform, collection_id, after, before)
+        rows = self._matched_rows(words, ids, platform, collection_id, after, before, full, offset, size)
         ranked = [(self._rank(row, words, full), row) for row in rows]
         grouped: dict[str, list[tuple[int, sqlite3.Row]]] = {}
         for rank, row in ranked:
@@ -338,7 +358,7 @@ class RecallTools:
                 pair[1]["item_id"],
             )
         )
-        page, more = self._paginate(best_pairs, offset, size)
+        page, more = self._paginate(best_pairs, 0, size)
 
         items: list[dict[str, Any]] = []
         for rank, best in page:
@@ -366,6 +386,7 @@ class RecallTools:
         }
 
     # -- 工具 4 -----------------------------------------------------------
+    @_read_snapshot
     def recall_get_item(
         self,
         item_id: str,
@@ -414,6 +435,9 @@ class RecallTools:
         collection_id: str | None,
         after: str | None,
         before: str | None,
+        full: str,
+        offset: int,
+        limit: int,
     ) -> list[sqlite3.Row]:
         scope_sql, params = self._scope_sql()
         where = ["e.active = 1", scope_sql]
@@ -444,15 +468,36 @@ class RecallTools:
                 + segment_scope + "))"
             )
             params.extend([pattern, pattern])
-        sql = (
+        title_matches = " AND ".join("instr(e.title_norm, ?) > 0" for _ in words) or "0"
+        rank_sql = (
+            "CASE WHEN ? != '' AND instr(e.title_norm, ?) > 0 THEN 0 "
+            "WHEN " + title_matches + " THEN 1 ELSE 2 END"
+        )
+        joins = (
+            "FROM entries e JOIN collections c ON c.collection_id = e.collection_id "
+            "JOIN items i ON i.item_id = e.item_id "
+        )
+        select = (
             "SELECT e.entry_id, e.item_id, e.collection_id, e.external_key, e.title, "
             "e.excerpt, e.note, e.link_url, e.saved_at, e.imported_at, e.last_seen_at, "
             "e.capture, e.access, e.title_norm, e.search_norm, "
             "i.platform, i.canonical_url, c.source_id, c.path_json, c.access AS collection_access "
-            "FROM entries e JOIN collections c ON c.collection_id = e.collection_id "
-            "JOIN items i ON i.item_id = e.item_id WHERE " + " AND ".join(where)
+            + joins
         )
-        return self.conn.execute(sql, params).fetchall()
+        # 在 SQLite 内选出本页内容项，只把这些内容项的匹配证据送回 Python。
+        paged_sql = (
+            "WITH matched AS (SELECT e.entry_id, e.item_id, " + rank_sql + " AS match_rank, "
+            "COALESCE(e.saved_at, e.imported_at) AS sort_time " + joins
+            + "WHERE " + " AND ".join(where) + "), ranked AS ("
+            "SELECT item_id, match_rank, sort_time, "
+            "ROW_NUMBER() OVER (PARTITION BY item_id ORDER BY match_rank, "
+            "sort_time DESC, entry_id) AS evidence_number FROM matched"
+            "), page AS (SELECT item_id FROM ranked WHERE evidence_number = 1 "
+            "ORDER BY match_rank, sort_time DESC, item_id LIMIT ? OFFSET ?) "
+            + select + "WHERE e.entry_id IN (SELECT entry_id FROM matched "
+            "WHERE item_id IN (SELECT item_id FROM page))"
+        )
+        return self.conn.execute(paged_sql, [full, full, *words, *params, limit + 1, offset]).fetchall()
 
     def _item_rows(self, item_id: str) -> list[sqlite3.Row]:
         scope_sql, params = self._scope_sql()
@@ -490,13 +535,16 @@ class RecallTools:
         sql = (
             "SELECT kind, text, locator_json FROM media_segments WHERE entry_id = ?"
             + ("" if self.include_restricted else " AND access = 'standard'")
-            + " ORDER BY segment_id"
         )
-        rows = self.conn.execute(sql, (entry_id,)).fetchall()
+        params: list[Any] = [entry_id]
+        if words:
+            sql += " AND (" + " OR ".join("search_norm LIKE ? ESCAPE '\\'" for _ in words) + ")"
+            params.extend(like_literal(word) for word in words)
+        sql += " ORDER BY segment_id LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
         result = []
         for row in rows:
-            if words and not any(word in (row["text"] and normalize(row["text"])) for word in words):
-                continue
             result.append(
                 {
                     "kind": row["kind"],
@@ -505,8 +553,6 @@ class RecallTools:
                     "locator": json.loads(row["locator_json"]),
                 }
             )
-            if len(result) >= limit:
-                break
         return result
 
     def _matched_snippets(self, entry_ids: list[str], words: list[str]) -> list[dict[str, Any]]:

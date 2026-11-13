@@ -5,12 +5,11 @@ Access Secret 只由同步进程读取；除 HTTP 状态外检查响应 Code；�
 """
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from ..clock import now
 from ..errors import RecallError
-from .base import Connector, FetchResult, check_budget, make_entry
+from .base import Connector, FetchResult, check_budget, make_entry, checkpoint
 from .http import UrllibHttpClient
 
 DEFAULT_BASE = "https://api.zhihu.com"
@@ -95,22 +94,27 @@ class ZhihuApiConnector(Connector):
         favlists = data.get("Items") or []
         if not isinstance(favlists, list):
             raise RecallError("SOURCE_FORMAT_CHANGED", "收藏夹列表格式变化。")
+        progress = checkpoint(state, mode)
+        start = next((i for i, item in enumerate(favlists)
+                      if str(item.get("UrlToken")) == str(progress.get("folder_id"))), 0)
         pages_used = 0
         finished = True
-        for favlist in favlists:
+        for index in range(start, len(favlists)):
+            favlist = favlists[index]
             token = favlist.get("UrlToken")
             title = favlist.get("Title") or "知乎收藏夹"
             if not token:
                 result.warnings.append("MISSING_URLTOKEN")
                 finished = False
                 continue
-            offset = 0
+            offset = progress.get("offset", 0) if mode == "full" and index == start else 0
             seen_offsets: set[str] = set()
             while True:
                 if str(offset) in seen_offsets:
                     raise RecallError("SOURCE_FORMAT_CHANGED", "夹内分页出现循环。")
                 seen_offsets.add(str(offset))
-                if pages_used >= max_pages:
+                if pages_used >= max_pages or not check_budget(result, budget):
+                    result.continuation = {"folder_id": str(token), "offset": offset}
                     finished = False
                     break
                 payload = get(
@@ -131,11 +135,15 @@ class ZhihuApiConnector(Connector):
                         make_entry(
                             fields["url"], title=fields["title"],
                             excerpt=fields["excerpt"], saved_at=fields["saved_at"],
-                            path=(str(title),),
+                            path=(str(title),), collection_key=f"zhihu:{token}",
                             external_key=f"fav:{token}:{fields['id']}",
                         )
                     )
                 paging = payload_data.get("Paging") or {}
+                if mode == "head":
+                    following = favlists[(index + 1) % len(favlists)]
+                    result.continuation = {"folder_id": str(following.get("UrlToken")), "offset": 0}
+                    break
                 if paging.get("IsEnd"):
                     break
                 next_offset = paging.get("NextOffset")
@@ -144,10 +152,7 @@ class ZhihuApiConnector(Connector):
                     finished = False
                     break
                 offset = next_offset
-                if not check_budget(result, budget):
-                    finished = False
-                    break
-            if not finished and mode == "head":
+            if result.continuation or not finished:
                 break
         result.complete = False  # 官方接口只覆盖公开范围，绝不据此对账
         result.coverage = "authorized_subset"

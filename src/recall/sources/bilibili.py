@@ -10,7 +10,6 @@ from typing import Any
 
 from ..errors import RecallError
 from .base import Connector, FetchResult, check_budget, make_entry, require_session
-from .http import UrllibHttpClient
 
 BASE = "https://api.bilibili.com"
 
@@ -33,7 +32,7 @@ def parse_folders(payload: Any) -> list[dict[str, Any]]:
             {
                 "id": str(media_id),
                 "title": str(item.get("title") or "未命名收藏夹"),
-                "private": bool(int(item.get("attr") or 0) & 1),
+                "private": item.get("attr") is None or bool(int(item["attr"]) & 1),
             }
         )
     return folders
@@ -150,6 +149,7 @@ class BilibiliFavoritesConnector(Connector):
                     {"media_id": folder["id"], "pn": page, "ps": 20, "platform": "web"},
                 )
                 medias, has_more = parse_medias(payload)
+                result.collection_keys.add(f"bilibili:{folder['id']}")
                 for media in medias:
                     if media.get("invalid"):
                         result.warnings.append("INVALID_MEDIA")
@@ -158,7 +158,7 @@ class BilibiliFavoritesConnector(Connector):
                         make_entry(
                             media["url"], title=media["title"],
                             excerpt=media["excerpt"], saved_at=media["saved_at"],
-                            path=(folder["title"],), external_key=media["key"],
+                            path=(folder["title"],), collection_key=f"bilibili:{folder['id']}", external_key=media["key"],
                             access="restricted" if folder["private"] else "standard",
                             collection_access="restricted" if folder["private"] else "standard",
                         )
@@ -169,7 +169,7 @@ class BilibiliFavoritesConnector(Connector):
                 page += 1
             if result.continuation:
                 break
-        result.complete = mode == "full" and result.continuation is None and not resumed and not result.warnings
+        result.complete = mode == "full" and result.continuation is None and not result.warnings
         result.coverage = "authorized_view" if result.complete else "authorized_subset"
         if result.continuation or (mode == "full" and resumed):
             result.warnings.append("BATCHED_SNAPSHOT")

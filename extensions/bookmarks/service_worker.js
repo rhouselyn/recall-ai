@@ -7,6 +7,7 @@ const MAX_NODES = 20000;
 
 let debounceTimer = null;
 let sending = false;
+let sendAgain = false;
 
 async function getState() {
   return chrome.storage.local.get({
@@ -51,7 +52,7 @@ function scheduleSend() {
 }
 
 async function sendTree() {
-  if (sending) return;
+  if (sending) { sendAgain = true; return; }
   sending = true;
   try {
     const state = await getState();
@@ -67,7 +68,8 @@ async function sendTree() {
       browser: /Edg\//.test(navigator.userAgent) ? "edge" : "chrome",
       profile_uuid: profileUuid,
       version,
-      nodes
+      nodes,
+      accept_empty: !nodes.some(node => node.url)
     };
     const response = await chrome.runtime.sendNativeMessage(NATIVE_HOST, message);
     if (response && response.ok && response.version === version) {
@@ -82,6 +84,7 @@ async function sendTree() {
     }
   } finally {
     sending = false;
+    if (sendAgain) { sendAgain = false; scheduleSend(); }
   }
 }
 

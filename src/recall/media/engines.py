@@ -61,15 +61,13 @@ def decode_audio_16k(path: str | Path) -> Any:
     except ImportError as exc:
         raise EngineUnavailable("PyAV / numpy 未安装") from exc
     resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
-    chunks: list[Any] = []
     with av.open(str(path)) as container:
         for frame in container.decode(audio=0):
             for resampled in resampler.resample(frame):
                 array = resampled.to_ndarray()
-                chunks.append(np.asarray(array, dtype=np.float32).reshape(-1))
+                yield np.asarray(array, dtype=np.float32).reshape(-1)
         for resampled in resampler.resample(None):
-            chunks.append(np.asarray(resampled.to_ndarray(), dtype=np.float32).reshape(-1))
-    return chunks
+            yield np.asarray(resampled.to_ndarray(), dtype=np.float32).reshape(-1)
 
 
 def default_asr(path: str | Path) -> list[dict[str, Any]]:
@@ -81,10 +79,7 @@ def default_asr(path: str | Path) -> list[dict[str, Any]]:
     except ImportError as exc:
         raise EngineUnavailable("sherpa-onnx 未安装") from exc
     chunks = decode_audio_16k(path)
-    if not chunks:
-        return []
     import numpy as np
-    audio = np.concatenate(chunks)
     recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
         paraformer=os.path.join(model_dir, "model.int8.onnx"),
         tokens=os.path.join(model_dir, "tokens.txt"),
@@ -97,9 +92,7 @@ def default_asr(path: str | Path) -> list[dict[str, Any]]:
     window = 30 * 16000  # 长音频按 30 秒窗口分段，边界重叠 1 秒
     overlap = 16000
     segments: list[dict[str, Any]] = []
-    offset = 0
-    while offset < len(audio):
-        samples = audio[offset : offset + window]
+    def recognize(samples, offset):
         if len(samples) >= 1600:
             stream = recognizer.create_stream()
             stream.accept_waveform(16000, samples)
@@ -113,9 +106,26 @@ def default_asr(path: str | Path) -> list[dict[str, Any]]:
                         "end_seconds": round((offset + len(samples)) / 16000, 2),
                     },
                 })
-        if offset + window >= len(audio):
-            break
-        offset += window - overlap
+    buffer = np.empty(window, dtype=np.float32)
+    used = offset = 0
+    fresh = 0
+    for chunk in chunks:
+        chunk = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        position = 0
+        while position < len(chunk):
+            size = min(window - used, len(chunk) - position)
+            buffer[used:used + size] = chunk[position:position + size]
+            used += size
+            fresh += size
+            position += size
+            if used == window:
+                recognize(buffer, offset)
+                buffer[:overlap] = buffer[-overlap:]
+                used = overlap
+                fresh = 0
+                offset += window - overlap
+    if fresh:
+        recognize(buffer[:used], offset)
     return segments
 
 

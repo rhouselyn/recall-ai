@@ -7,9 +7,7 @@ import mimetypes
 import os
 import re
 import secrets
-import traceback
 import threading
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -19,12 +17,17 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import catalog, db, ingest, watch
 from .errors import RecallError, from_exception
-from .sources.browser import connect as browser_connect, load_session
+from .sources.browser import connect as browser_connect
 from .sources.runner import sync_once
 from .secrets import deepseek_key, load_secret, save_secret
 from .tools import RecallTools
 
-FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
+FRONTEND = Path(__file__).with_name("frontend")
+EXTENSION_DIR = Path(__file__).with_name("bookmarks_extension")
+if not FRONTEND.is_dir():
+    FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
+if not EXTENSION_DIR.is_dir():
+    EXTENSION_DIR = Path(__file__).resolve().parents[2] / "extensions" / "bookmarks"
 PLATFORMS = {
     "github": ("github_stars", "github"),
     "bilibili": ("bilibili_favorites", "bilibili"),
@@ -87,33 +90,8 @@ class RecallServer(ThreadingHTTPServer):
         return {"job_id": job_id}
 
     def sync(self, source_id):
-        conn = db.open_readwrite(self.db_path)
-        try:
-            source = catalog.get_source(conn, source_id)
-        finally:
-            conn.close()
-        if not source:
-            raise RecallError("NOT_FOUND")
-        session = None
-        try:
-            if source["kind"] in BROWSER_KINDS:
-                session = load_session(source_id, source["kind"], self.db_path)
-            return sync_once(self.db_path, source_id, full=True, session=session,
-                             env={**os.environ, **self.credentials})
-        except Exception as exc:
-            error = from_exception(exc)
-            conn = db.open_readwrite(self.db_path)
-            try:
-                catalog.update_sync_state(
-                    conn, source_id, latest_attempt="failed", last_error_type=error.code,
-                    state="needs_login" if error.code == "AUTH_REQUIRED" else "error",
-                )
-            finally:
-                conn.close()
-            raise
-        finally:
-            if session is not None:
-                session.close()
+        return sync_once(self.db_path, source_id, full=True,
+                         env={**os.environ, **self.credentials})
 
 
 def retrieve(tools, text, platform):
@@ -121,12 +99,14 @@ def retrieve(tools, text, platform):
     words = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9+#.-]{2,}", query)
     candidates = []
     for word in words[:5]:
+        word = word[:200]
         candidates.append(word)
         if re.fullmatch(r"[\u4e00-\u9fff]{4,}", word):
             candidates.extend(word[i:i + 2] for i in range(0, len(word) - 1, 2))
     found = {}
     coverage = []
-    for candidate in dict.fromkeys(candidates):
+    # shortcut: 最多检索 12 个候选词；复杂问句召回需独立评测后替换分词策略。
+    for candidate in list(dict.fromkeys(candidates))[:12]:
         result = tools.recall_search(query=candidate, platform=platform or None, limit=10)
         coverage = result["coverage"]
         for item in result["items"]:
@@ -247,7 +227,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/session":
                 return self._json({"token": self.server.token,
-                                   "extension_dir": str(FRONTEND.parent / "extensions" / "bookmarks")})
+                                   "extension_dir": str(EXTENSION_DIR)})
             if parsed.path.startswith("/api/jobs/"):
                 with self.server.jobs_lock:
                     job = self.server.jobs.get(parsed.path.rsplit("/", 1)[-1])
@@ -264,7 +244,8 @@ class Handler(BaseHTTPRequestHandler):
                         platform=params.get("platform", [None])[0], limit=50,
                         cursor=params.get("cursor", [None])[0]))
                 if parsed.path.startswith("/api/items/"):
-                    return self._json(tools.recall_get_item(parsed.path.rsplit("/", 1)[-1], limit=50))
+                    return self._json(tools.recall_get_item(parsed.path.rsplit("/", 1)[-1], limit=50,
+                                                          cursor=params.get("cursor", [None])[0]))
             raise RecallError("NOT_FOUND")
         except Exception as exc:
             return self._json(from_exception(exc).body, 400)
@@ -281,22 +262,33 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return self._json({"error": {"message": "请求来源无效。"}}, 403)
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise RecallError("INVALID_ARGUMENT", "请求大小无效。") from exc
             if length <= 0 or length > 30 * 1024 * 1024:
                 raise RecallError("INVALID_ARGUMENT", "请求大小无效。")
             try:
                 data = json.loads(self.rfile.read(length).decode("utf-8"))
-            except UnicodeDecodeError as exc:
-                raise RecallError("INVALID_ARGUMENT", "请求体必须是 UTF-8 编码。") from exc
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RecallError("INVALID_ARGUMENT", "请求体必须是 UTF-8 JSON 对象。") from exc
             if not isinstance(data, dict):
                 raise RecallError("INVALID_ARGUMENT")
+            for field in ("text", "url", "title", "collection", "content", "kind", "filename",
+                          "item_id", "entry_id", "platform", "extension_id", "token", "collections",
+                          "user_id", "source_id"):
+                if field in data and not isinstance(data[field], str):
+                    raise RecallError("INVALID_ARGUMENT", f"{field} 必须是字符串。")
             path = urlsplit(self.path).path
             if path == "/api/chat":
                 text = data.get("text", "").strip()
                 if not text or len(text) > 1500:
                     raise RecallError("INVALID_ARGUMENT", "请输入不超过 1500 字的问题。")
                 history = data.get("history", [])
-                if not isinstance(history, list):
+                if not isinstance(history, list) or any(
+                    not isinstance(turn, dict) or not isinstance(turn.get("text"), str)
+                    or turn.get("role") not in ("user", "assistant") for turn in history
+                ):
                     raise RecallError("INVALID_ARGUMENT", "对话历史无效。")
                 previous = next((turn.get("text", "") for turn in reversed(history)
                                  if isinstance(turn, dict) and turn.get("role") == "user"), "")
@@ -311,7 +303,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/import":
                 import base64
                 import tempfile
-                content = base64.b64decode(data.get("content", ""), validate=True)
+                try:
+                    content = base64.b64decode(data.get("content", ""), validate=True)
+                except ValueError as exc:
+                    raise RecallError("INVALID_ARGUMENT", "文件编码无效。") from exc
                 if len(content) > 20 * 1024 * 1024:
                     raise RecallError("INVALID_ARGUMENT", "文件超过 20 MiB。")
                 kind = data.get("kind")
@@ -333,20 +328,27 @@ class Handler(BaseHTTPRequestHandler):
                 suffix = Path(data.get("filename", "")).suffix.lower()
                 if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".wav", ".mp3", ".m4a", ".mp4", ".mov", ".flac", ".ogg"}:
                     raise RecallError("INVALID_ARGUMENT", "不支持该媒体类型。")
-                content = base64.b64decode(data.get("content", ""), validate=True)
+                try:
+                    content = base64.b64decode(data.get("content", ""), validate=True)
+                except ValueError as exc:
+                    raise RecallError("INVALID_ARGUMENT", "文件编码无效。") from exc
                 if not content or len(content) > 20 * 1024 * 1024:
                     raise RecallError("INVALID_ARGUMENT", "请选择不超过 20 MiB 的媒体文件。")
                 with RecallTools.open(self.server.db_path, include_restricted=True) as tools:
                     detail = tools.recall_get_item(data.get("item_id", ""), limit=50)
                     if data.get("entry_id") not in {item["entry_id"] for item in detail["evidence"]}:
                         raise RecallError("NOT_FOUND")
-                directory = Path(self.server.db_path).parent / "media"
+                from .config import media_dir
+                directory = media_dir(self.server.db_path) / "uploads"
                 directory.mkdir(parents=True, exist_ok=True)
                 media_path = directory / (uuid.uuid4().hex + suffix)
                 media_path.write_bytes(content)
                 def media_job():
-                    return index_media(self.server.db_path, data.get("item_id", ""), media_path,
-                                       entry_id=data.get("entry_id") or None)
+                    try:
+                        return index_media(self.server.db_path, data.get("item_id", ""), media_path,
+                                           entry_id=data.get("entry_id") or None)
+                    finally:
+                        media_path.unlink(missing_ok=True)
                 return self._json(self.server.job(media_job))
             if path == "/api/bookmarks/register":
                 import importlib.util
@@ -366,7 +368,7 @@ class Handler(BaseHTTPRequestHandler):
                                           refresh_mode="event", sync_enabled=True)
                 finally:
                     conn.close()
-                script = FRONTEND.parent / "extensions" / "bookmarks" / "register_windows.py"
+                script = EXTENSION_DIR / "register_windows.py"
                 spec = importlib.util.spec_from_file_location("recall_bookmark_registration", script)
                 if spec is None or spec.loader is None:
                     raise RecallError("CONFIG_ERROR", "未找到浏览器扩展注册程序。")
@@ -449,7 +451,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(watch.resume_source(self.server.db_path, data.get("source_id", "")))
             raise RecallError("NOT_FOUND")
         except Exception as exc:
-            traceback.print_exc()  # 本地服务：完整堆栈进 stderr，页面仍显示通用错误
             return self._json(from_exception(exc).body, 400)
 
 

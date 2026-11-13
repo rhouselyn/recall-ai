@@ -11,7 +11,7 @@
 两个明确的边界：
 
 - **只找你自己的东西**：搜索只覆盖已导入或已同步的数据，不混入平台全站搜索；条目只有元数据时，结果也只是元数据。
-- **数据不出本机**：收藏存在本地数据库；发给对话模型的只有你的问题、最近对话和检索到的相关收藏片段。
+- **收藏存储在本机**：使用 DeepSeek 时，会发送你的问题、最近对话和检索到的相关收藏片段；使用本地 Ollama 时，这些内容留在本机。
 
 ## 功能特性
 
@@ -67,7 +67,7 @@ python -m pip install -e ".[media]"    # 需要本地 OCR / ASR
 
 `recall serve`（或双击 `启动 Recall AI.bat`）后访问 http://127.0.0.1:8765：
 
-- **搜索 / 对话**：主界面即搜即问；对话发送问题、最近对话和检索到的相关收藏片段至 DeepSeek，密钥不可用时尝试本地 Ollama，都未配置则返回本地检索结果。
+- **搜索 / 对话**：主界面即搜即问；已配置 DeepSeek 密钥时，对话会发送问题、最近对话和检索片段。未配置密钥时尝试本地 Ollama；模型调用失败则返回本地检索结果。密钥通过 `DEEPSEEK_API_KEY` 配置。
 - **账号连接**：GitHub 填只读 PAT；网页平台在页面里发起登录和同步（需要本机 Chrome 或 Playwright 安装的 Chromium）；部分平台需填写本人用户 ID，知乎私密夹还需收藏夹 ID。平台页面和第三方接口会变动，实际可读范围以同步结果为准。
 - **媒体识别**：选择本地图片、音频或视频进行识别，单个文件上限 20 MiB；媒体副本保存在数据库所在目录的 `media` 子目录，更大的文件走 CLI。
 
@@ -120,16 +120,24 @@ recall source pause github-personal
 recall source resume github-personal
 ```
 
-- 凭据只由同步进程从环境变量读取，不进命令参数、SQLite、MCP 配置或日志。Windows 下 GitHub 只读令牌、DeepSeek 密钥可用当前用户 DPAPI 加密保存（网页里填写即可）；其他系统暂存于服务进程，也可通过 `RECALL_GITHUB_TOKEN` 提供。
+- GitHub 凭据通过 `RECALL_GITHUB_TOKEN` 或网页输入，不进命令参数、SQLite、MCP 配置或日志。Windows 网页输入的 GitHub 令牌用当前用户 DPAPI 加密保存；其他系统暂存于服务进程。DeepSeek 密钥通过 `DEEPSEEK_API_KEY` 配置，也兼容读取已存在的 DPAPI 密钥文件；当前网页没有 DeepSeek 密钥设置入口。
 - `recall watch` 与手动 `recall sync` 共用同一个租约；GitHub 默认每 90 秒读头部、每 12 小时完整对账。失败按 401 / 账号不匹配 / 限流 / 格式变化分别报告，旧副本继续可查。`--accept-empty` 用于显式接受异常空快照。
-- 服务运行时自动轮询：GitHub / YouTube 约每 5 分钟，B 站收藏多时按批次续传、约每 2 分钟刷新。平台未提供推送，是轮询而非即时推送。
+- 服务运行时自动轮询：GitHub 约每 90 秒、YouTube 约每 5 分钟，B 站收藏多时按批次续传、约每 2 分钟刷新。平台未提供推送，是轮询而非即时推送。
 - YouTube 在「账号连接」中登录自己的 Google / YouTube 账号，关闭登录窗口后开始同步；连接器用 yt-dlp 和本机隔离浏览器会话读取稍后观看、喜欢的视频及页面发现的播放列表，按私密数据处理。平台限制、视频不可用或页面变化可能导致部分列表失败；不会因为部分读取失败删除旧收藏。
 - `zhihu_api`、`zhihu_web`、`bilibili_favorites`、`xiaohongshu_favorites`、`douyin_favorites` 的连接器已按规格实现（分页、循环检测、额度预算、会话校验、覆盖范围标记），但**协议字段和私密覆盖范围必须用本人账号验收**；测试套件默认不连外网、不使用用户会话。未取得权限时请继续用 CSV 和单条链接补充。
 - 登录浏览器连接器需要先 `recall source connect <id>`，Playwright 为可选依赖。
 
+浏览器资料目录按数据库路径和来源 ID 的哈希隔离（标点、大小写不同的来源不会共用登录）。旧目录只有 `identity.json` 的归属标签完全匹配才自动迁移，否则需要重新连接；抖音必须观察到本人身份响应才能同步，手填 ID 只用于核对。
+
+GitHub 和 B 站全量同步会持久保存分页进度与整轮已见证据，后台下一轮继续；B 站连续两轮完整结果都缺失才停用关系。GitHub 缺失的公开仓库需再次确认可访问才停用，私库或权限不明的旧证据保留并按受限内容处理；这类结果会报告 `MISSING_ENTRY_ACCESS_UNVERIFIED`。知乎首屏轮换已知收藏夹，全量保存夹内位置；仍只声明已读取的子集。
+
+知乎 API 默认每天最多发出 **20 次请求**，同一个数据库的来源共用计数，UTC 零点重置；失败请求也计数，重启不会清零。这是本地保护上限，不代表平台免费额度。可通过来源配置 `--config daily_request_limit=20` 调整，`0` 禁止发出请求。
+
+平台收藏夹和实时书签使用稳定夹 ID，名称仅用于展示与搜索。能唯一对应且覆盖旧夹证据时自动沿用旧 ID，保留媒体；历史同名混合或旧名称无法确定归属时保留旧证据，避免猜测迁移。
+
 ### MCP stdio
 
-`RECALL_ALLOWED_SOURCES` 必须由用户明确配置，缺失即启动失败；默认不暴露 `restricted`，可信宿主可显式设置 `RECALL_INCLUDE_RESTRICTED=1`。`pyproject.toml` 的 `[mcp]` 使用官方 SDK v2 稳定线，联调验证版本为 `mcp==2.3.0`，发布前请固定该版本。
+`RECALL_ALLOWED_SOURCES` 必须由用户明确配置，缺失即启动失败；默认不暴露 `restricted`，可信宿主可显式设置 `RECALL_INCLUDE_RESTRICTED=1`。`pyproject.toml` 的 `[mcp]` 固定使用经 stdio 联调验证的 `mcp==2.3.0`；已有 v1 环境需重新安装 `.[mcp]`。
 
 ```json
 {
@@ -153,10 +161,10 @@ stdout 只用于协议；日志写 stderr，只记录来源 ID、数量和错误
 3. 注册主机（当前用户，无需管理员）：
 
    ```powershell
-   python extensions\bookmarks\register_windows.py --extension-id <ID> --python <venv>\Scripts\python.exe --source chrome-personal --browser all
+   python extensions\bookmarks\register_windows.py --extension-id <ID> --python <venv>\Scripts\python.exe --source chrome-personal --browser chrome
    ```
 
-   只生成清单、暂不写注册表时加 `--no-register --manifest-out <目录>`。
+   Edge 使用独立来源 ID、`--browser edge` 和独立的 `--manifest-out <目录>`；`--source` 固定主机来源，必须与扩展选项一致。只生成清单、暂不写注册表时加 `--no-register --manifest-out <目录>`。
 4. 重载扩展。启动、重连、定时校验和 `onImportEnded` 会补发最新树。
 
 主机 `python -m recall.native_host` 校验绑定、包结构和大小，写入同一个库并返回版本号。书签落到它所在的目录；空目录会保留，书签自己的标题不会变成收藏夹名。
@@ -172,6 +180,8 @@ recall media run --limit 10
 
 OCR 用 `rapidocr-onnxruntime`，ASR 用 `sherpa-onnx` + PyAV 解码重采样到 16 kHz 单声道，长音频按窗口分段。片段继承收藏关系的可见范围，查询时参与匹配并在详情标注「图片识别」/「音频转写」/「平台字幕」。模型缺失时任务标记 `unavailable`，不影响收藏元数据。同一内容存在多条关系时必须用 `--entry-id` 指定证据来源，避免把私密附件挂到公开关系上。
 
+媒体文件会流式复制到按数据库隔离的 `media` 子目录，再以内容哈希登记任务；修改原文件不会改变已登记内容。旧任务若原文件已变化，报告 `MEDIA_CHANGED`，需重新执行 `media index`。音频逐帧解码，PCM 缓冲最多 30 秒；任务原子领取、每 30 秒续租，崩溃后 5 分钟可恢复，自动最多尝试 3 次。手动重新索引可重试失败或模型不可用的任务。
+
 ### 备份与维护
 
 ```powershell
@@ -182,6 +192,8 @@ recall source remove old-source --yes
 
 备份用 SQLite 在线备份接口，目标已存在拒绝覆盖；恢复前先校验版本与完整性，并要求停止读写。删除来源只清本地数据，不触碰平台账号；此前备份仍可能含已删除内容。
 
+删除来源同时清理其浏览器资料和没有其他任务引用的托管媒体副本。正在同步、登录或提取时拒绝删除；文件占用导致清理失败时返回 `cleanup_pending`，关闭占用程序后重跑同一删除命令即可。原始文件、共享副本、无法确认归属的旧文件及全局共享密钥保留；返回的 `retained_files` 列出保留的文件。SQLite 备份不包含浏览器资料或媒体文件，换目录恢复时需要重新连接账号并单独恢复媒体。
+
 ## 配置参考
 
 所有配置均可省略，按默认行为运行。
@@ -189,7 +201,7 @@ recall source remove old-source --yes
 | 环境变量 | 说明 |
 | --- | --- |
 | `RECALL_DB` | 数据库文件路径，覆盖默认位置 |
-| `DEEPSEEK_API_KEY` | DeepSeek 对话密钥（Windows 也可在网页里填，走 DPAPI 加密保存） |
+| `DEEPSEEK_API_KEY` | DeepSeek 对话密钥（也兼容读取已有 Windows DPAPI 密钥文件） |
 | `DEEPSEEK_MODEL` | 对话模型，默认 `deepseek-flash` |
 | `RECALL_OLLAMA_MODEL` | 本地 Ollama 模型 |
 | `RECALL_GITHUB_TOKEN` | GitHub 只读 PAT（Windows 也可 DPAPI 保存） |
@@ -200,7 +212,9 @@ recall source remove old-source --yes
 ## 测试
 
 ```powershell
-python -m unittest discover -s tests -v      # 28 个用例，全离线
+python -m unittest discover -s tests -v      # 离线 Python 回归测试
+node tests/test_frontend.cjs                # 前端与扩展异步回归，无第三方依赖
+python tests/benchmark_search.py            # 临时库，20,000 条合成收藏性能检查
 python tests\mcp_stdio_probe.py              # 需要已安装 mcp SDK，走真实 stdio 往返
 ```
 

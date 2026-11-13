@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Any, Protocol
 
 from .. import catalog
@@ -25,6 +26,15 @@ class FetchResult:
     requests_used: int = 0
     not_modified: bool = False  # 304：只更新时间检查字段
     continuation: dict[str, Any] | None = None
+    collection_keys: set[str] = field(default_factory=set)
+
+
+def checkpoint(state: dict[str, Any] | None, mode: str) -> dict[str, Any]:
+    try:
+        value = json.loads((state or {}).get("last_summary") or "{}").get("continuation_" + mode)
+        return value if isinstance(value, dict) else {}
+    except (ValueError, TypeError, AttributeError):
+        return {}
 
 
 class BrowserSession(Protocol):
@@ -82,6 +92,7 @@ def make_entry(
     access: str = "standard",
     collection_access: str = "standard",
     capture: str = "account_sync",
+    collection_key: str | None = None,
 ) -> catalog.EntryInput:
     safe: SafeUrl = sanitize_url(raw_url)
     return catalog.EntryInput(
@@ -95,6 +106,7 @@ def make_entry(
         access=access,
         collection_access=collection_access,
         capture=capture,
+        collection_key=collection_key,
     )
 
 

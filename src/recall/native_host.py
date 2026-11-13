@@ -48,15 +48,17 @@ def write_message(stream: Any, payload: dict[str, Any]) -> None:
 
 
 def handle(payload: dict[str, Any], *, db_path: str | None = None, source_id: str | None = None) -> dict[str, Any]:
+    if source_id and payload.get("source_id") not in (None, source_id):
+        return {"ok": False, "error": {"code": "INVALID_ARGUMENT", "message": "来源与主机绑定不匹配。"}}
     target = payload.get("source_id") or source_id
     if not target:
         return {"ok": False, "error": {"code": "INVALID_ARGUMENT", "message": "缺少来源绑定。"}}
     try:
         response = import_bookmark_tree(db_path or str(default_db_path()), payload, target)
-        log(f"source={target} ok={response.get('ok')} version={payload.get('version')}")
+        log(f"source={ascii(target)} ok={response.get('ok')} version={payload.get('version')}")
         return response
     except Exception as exc:  # 不把底层异常文本或收藏内容写进协议/日志
-        log(f"source={target} error=INTERNAL_ERROR")
+        log(f"source={ascii(target)} error=INTERNAL_ERROR")
         return {
             "ok": False,
             "error": {"code": "INTERNAL_ERROR", "message": "写入失败，旧目录已保留。", "retryable": True},

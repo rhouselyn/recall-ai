@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 MAX_URL_LENGTH = 2048
 MAX_TITLE_LENGTH = 300
@@ -121,9 +121,10 @@ def sanitize_url(raw: str) -> SafeUrl:
     sanitized = False
     query = parts.query
     if query:
-        original_pairs = parse_qsl(query, keep_blank_values=True)
-        kept: list[tuple[str, str]] = []
-        for key, value in original_pairs:
+        original_pairs = query.split("&")
+        kept: list[str] = []
+        for pair in original_pairs:
+            key = unquote_plus(pair.split("=", 1)[0])
             low = key.lower()
             if low.startswith("utm_") or low in _TRACKING_EXACT:
                 removed.append(key)
@@ -131,9 +132,9 @@ def sanitize_url(raw: str) -> SafeUrl:
                 removed.append(key)
                 sanitized = True
             else:
-                kept.append((key, value))
+                kept.append(pair)
         if len(kept) != len(original_pairs):
-            query = urlencode(kept, doseq=True)
+            query = "&".join(kept)
 
     netloc = f"[{host}]" if ":" in host else host
     if port is not None and not (
@@ -164,13 +165,16 @@ def parse_timestamp(value: object) -> datetime | None:
     if isinstance(value, datetime):
         dt = value
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError) as exc:
+            raise ValueError("INVALID_TIMESTAMP") from exc
     else:
         text = str(value).strip()
         if not text:
             return None
         if re.fullmatch(r"-?\d+(\.\d+)?", text):
-            return datetime.fromtimestamp(float(text), tz=timezone.utc)
+            return parse_timestamp(float(text))
         normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
         try:
             dt = datetime.fromisoformat(normalized)
@@ -178,7 +182,10 @@ def parse_timestamp(value: object) -> datetime | None:
             raise ValueError("INVALID_TIMESTAMP") from exc
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    try:
+        return dt.astimezone(timezone.utc)
+    except (OverflowError, OSError) as exc:
+        raise ValueError("INVALID_TIMESTAMP") from exc
 
 
 def saved_at_iso(value: object) -> str | None:
@@ -211,13 +218,3 @@ def display_title(title: str | None, url: SafeUrl | str) -> str:
 
     parts = urlsplit(url.link_url if isinstance(url, SafeUrl) else url)
     return f"{parts.netloc}{parts.path}"
-
-
-@dataclass
-class Limits:
-    max_file_bytes: int = MAX_FILE_BYTES
-    max_items: int = MAX_ITEMS_PER_IMPORT
-    max_url: int = MAX_URL_LENGTH
-    max_title: int = MAX_TITLE_LENGTH
-    max_text: int = MAX_TEXT_LENGTH
-    truncated_fields: list[str] = field(default_factory=list)

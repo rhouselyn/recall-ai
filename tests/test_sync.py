@@ -60,6 +60,17 @@ class FakeHttp:
 
 
 class PlatformResponseTest(unittest.TestCase):
+    def test_rss_last_modified_survives_runner_state(self):
+        from recall.sources.rss import RssConnector
+        from unittest.mock import Mock
+        client = Mock()
+        client.request.return_value = HttpResponse(304)
+        stamp = "Fri, 13 Nov 2026 01:00:00 GMT"
+        result = RssConnector("rss", {"feed_url": "https://example.com/feed"}, http=client).fetch(
+            state={"last_summary": json.dumps({"text": stamp})})
+        self.assertTrue(result.not_modified)
+        self.assertEqual(client.request.call_args.kwargs["headers"]["If-Modified-Since"], stamp)
+
     def test_youtube_reads_private_lists_and_resumes_without_reconciliation(self):
         class Session:
             def status(self): return "ok"
@@ -131,6 +142,7 @@ class PlatformResponseTest(unittest.TestCase):
                 result = connector.fetch("full")
                 self.assertFalse(result.complete)
                 self.assertEqual(result.entries[0].access, "restricted")
+                self.assertEqual(result.account_id, "me")
 
     def test_bilibili_budget_keeps_first_page(self):
         from recall.sources.bilibili import BilibiliFavoritesConnector
@@ -171,7 +183,7 @@ class PlatformResponseTest(unittest.TestCase):
         )
         self.assertEqual(seen, [2, 1])
         self.assertIsNone(resumed.continuation)
-        self.assertFalse(resumed.complete)
+        self.assertTrue(resumed.complete)  # runner 负责验证并合并前面各批的证据。
 
     def test_bilibili_empty_folder_is_not_a_format_error(self):
         from recall.sources.bilibili import parse_medias
@@ -358,6 +370,16 @@ class SyncTestCase(unittest.TestCase):
         result = sync_once(self.db, "github-personal",
                            http=FakeHttp(not_modified_script), env=self.env)
         self.assertEqual(result["status"], "not_modified")
+
+    def test_rate_limit_respects_server_retry_delay(self):
+        script = {
+            f"{BASE}/user": [json_response({"id": 42})],
+            f"{BASE}/user/starred?per_page=100&page=1": [
+                json_response({}, status=429, headers={"Retry-After": "600"})
+            ],
+        }
+        result = sync_once(self.db, "github-personal", http=FakeHttp(script), env=self.env)
+        self.assertEqual(result["next_retry_at"], "2026-11-10T09:10:00Z")
 
     def test_watch_rotation_with_fixed_clock(self) -> None:
         http = FakeHttp({

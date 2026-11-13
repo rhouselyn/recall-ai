@@ -187,7 +187,6 @@ def init_db(path: str | Path | None = None, *, backup_on_upgrade: bool = True) -
     """创建或幂等打开当前版本库；升级前自动备份。"""
     target = resolve_db_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    existed = target.exists()
     conn = _connect_rw(target)
     try:
         version = schema_version(conn)
@@ -262,13 +261,27 @@ def backup_db(src: str | Path | None, dst: str | Path) -> Path:
     if not source.is_file():
         raise RecallError("DB_NOT_READY", "源库不存在。")
     source_conn = _connect_ro(source)
-    dest_conn = sqlite3.connect(str(destination))
     try:
-        source_conn.backup(dest_conn)
+        _backup_to_new_file(source_conn, destination)
     finally:
-        dest_conn.close()
         source_conn.close()
     return destination
+
+
+def _backup_to_new_file(source_conn: sqlite3.Connection, destination: Path) -> None:
+    try:
+        destination.touch(exist_ok=False)
+    except FileExistsError as exc:
+        raise RecallError("INVALID_ARGUMENT", "目标已存在，拒绝覆盖。") from exc
+    try:
+        dest_conn = sqlite3.connect(str(destination))
+        try:
+            source_conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 def verify_db(path: str | Path) -> dict[str, Any]:
@@ -299,10 +312,8 @@ def restore_db(backup: str | Path, target: str | Path) -> Path:
         raise RecallError("INVALID_ARGUMENT", "恢复目标已存在，拒绝覆盖；请先移走现有库。")
     destination.parent.mkdir(parents=True, exist_ok=True)
     src_conn = _connect_ro(Path(info["path"]))
-    dst_conn = sqlite3.connect(str(destination))
     try:
-        src_conn.backup(dst_conn)
+        _backup_to_new_file(src_conn, destination)
     finally:
-        dst_conn.close()
         src_conn.close()
     return destination

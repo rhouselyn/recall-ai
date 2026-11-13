@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import uuid
+from contextlib import ExitStack
 from datetime import timedelta
 from typing import Any
 
@@ -34,12 +35,6 @@ def _parse_summary(state: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
-def _release(conn: Any, source_id: str, state: dict[str, Any]) -> None:
-    catalog.update_sync_state(
-        conn, source_id, lease_owner=None, lease_until=None, state=state.get("state", "idle")
-    )
-
-
 def sync_once(
     db_path: str | os.PathLike[str],
     source_id: str,
@@ -58,6 +53,7 @@ def sync_once(
     lease_until = iso(now() + timedelta(seconds=300))
     state: dict[str, Any] = {}
     run_id: str | None = None
+    resources = ExitStack()
     try:
         with catalog.transaction(conn):
             source = catalog.get_source(conn, source_id)
@@ -76,12 +72,42 @@ def sync_once(
             )
             mode = "full" if full else "head"
             run_id = catalog.start_run(conn, source_id, mode, state.get("coverage"))
+        from ..leases import heartbeat
+        resources.enter_context(heartbeat(db_path, lambda connection: connection.execute(
+            "UPDATE sync_state SET lease_until=? WHERE source_id=? AND lease_owner=?",
+            (iso(now() + timedelta(seconds=300)), source_id, owner),
+        ).rowcount))
+        from .browser import PLATFORM_START, load_session
+        config = json.loads(source.get("config_json") or "{}")
+        if session is None and source["kind"] in PLATFORM_START and not (
+            source["kind"] == "bilibili_favorites" and config.get("allow_direct_http") and http is not None
+        ):
+            session = load_session(source_id, source["kind"], db_path)
+            resources.callback(session.close)
+        if source["kind"] == "zhihu_api":
+            from urllib.parse import urlsplit
+            from .http import UrllibHttpClient
+            from .quota import DailyQuotaClient
+            client = http or UrllibHttpClient(
+                allowed_hosts=(urlsplit(config.get("api_base", "https://api.zhihu.com")).hostname,),
+                max_retries=0,
+            )
+            http = DailyQuotaClient(conn, client, config.get("daily_request_limit", 20))
+            budget = dict(budget or {})
+            budget["max_requests"] = min(budget.get("max_requests", 20), http.remaining())
+        scope = hashlib.sha256(json.dumps({k: v for k, v in config.items() if k != "account_id"},
+                                         sort_keys=True).encode()).hexdigest()
+        prior_scope = _parse_summary(state)
+        if prior_scope.get("scope") not in (None, scope):
+            for key in ("continuation_full", "continuation_head", "snapshot_seen", "snapshot_valid", "absent_once"):
+                prior_scope.pop(key, None)
+            state = {**state, "last_summary": json.dumps(prior_scope)}
         connector = get_connector(source, state, http=http, session=session, env=env)
         try:
             result = connector.fetch(mode=mode, state=state, budget=budget)
         except RecallError as exc:
             return _finish_failure(
-                conn, source_id, run_id, exc, state, owner, started,
+                conn, source_id, run_id, exc, state, owner,
             )
 
         # 304：只更新时间检查字段，不写内容、不推进目录版本。
@@ -95,7 +121,7 @@ def sync_once(
                     conn, source_id,
                     last_incremental_at=now_iso(), last_etag=result.etag or state.get("last_etag"),
                     latest_attempt="succeeded", state="idle", failure_count=0,
-                    next_retry_at=None, lease_owner=None, lease_until=None,
+                    next_retry_at=None,
                 )
                 catalog.finish_run(conn, run_id, "succeeded", counts={"not_modified": 1})
             return {
@@ -103,20 +129,45 @@ def sync_once(
                 "coverage": state.get("coverage") or source["coverage"],
             }
 
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM entries e JOIN collections c "
-            "ON c.collection_id = e.collection_id WHERE c.source_id = ? AND e.active = 1",
-            (source_id,),
-        ).fetchone()[0]
-        if result.complete and full:
-            if existing and not result.entries and not accept_empty:
-                raise RecallError(
-                    "SNAPSHOT_INCOMPLETE", "完整快照为空，旧收藏关系保持不变。"
-                )
-            if existing and len(result.entries) * 2 < existing and not accept_empty:
-                raise RecallError(
-                    "SNAPSHOT_INCOMPLETE", "结果数量突降，只记录状态，不做对账。"
-                )
+        prior = _parse_summary(state)
+        resumed = full and bool(prior.get("continuation_full"))
+        accumulated = set(prior.get("snapshot_seen") or []) if resumed else set()
+        verified_collections = set(prior.get("snapshot_collections") or []) if resumed else set()
+        verified_collections.update(result.collection_keys)
+        valid = (not resumed or prior.get("snapshot_valid") is True) and not any(
+            warning not in {"BUDGET_EXHAUSTED", "BATCHED_SNAPSHOT"} for warning in result.warnings
+        )
+        if full and result.complete and not valid:
+            result.complete = False
+            result.coverage = "authorized_subset"
+            result.warnings.append("SNAPSHOT_NOT_VERIFIABLE")
+        existing_rows = conn.execute(
+            "SELECT e.entry_id, e.external_key, e.access, c.access AS collection_access, "
+            "c.external_key AS collection_key FROM entries e JOIN collections c USING(collection_id) "
+            "WHERE c.source_id=? AND e.active=1", (source_id,),
+        ).fetchall()
+        existing = len(existing_rows)
+        total = len(accumulated) + len(result.entries)
+        if result.complete and full and existing and not accept_empty:
+            if not total or total * 2 < existing:
+                raise RecallError("SNAPSHOT_INCOMPLETE", "完整快照为空或数量突降，旧收藏关系保持不变。")
+        removable = None
+        unverified = set()
+        if full and result.complete and hasattr(connector, "can_remove") and not accept_empty:
+            current_keys = {entry.external_key for entry in result.entries}
+            removable = set()
+            for row in existing_rows:
+                if row["entry_id"] not in accumulated and row["external_key"] not in current_keys:
+                    try:
+                        if connector.can_remove(dict(row), result):
+                            removable.add(row["entry_id"])
+                        else:
+                            unverified.add(row["entry_id"])
+                            result.warnings.append("MISSING_ENTRY_ACCESS_UNVERIFIED")
+                    except RecallError:
+                        unverified.add(row["entry_id"])
+                        result.warnings.append("MISSING_ENTRY_ACCESS_UNVERIFIED")
+            result.warnings = list(dict.fromkeys(result.warnings))
 
         # 提交前复核租约，避免与并发任务重复写入。
         counts: dict[str, Any] = {}
@@ -126,16 +177,31 @@ def sync_once(
                 catalog.finish_run(conn, run_id, "failed", error_code="DB_BUSY")
                 return {"source_id": source_id, "status": "skipped", "reason": "lease_lost"}
             summary = _parse_summary(current)
-            if result.complete and full and connector.trusted:
-                write_result = catalog.replace_snapshot(
-                    conn, source_id, result.entries, allow_empty=accept_empty,
-                )
-            elif result.complete and full:
-                write_result = _two_strike_reconcile(
-                    conn, source_id, result.entries, started, summary,
-                )
-            else:
-                write_result = catalog.merge_entries(conn, source_id, result.entries)
+            if summary.get("scope") not in (None, scope):
+                summary = {k: v for k, v in summary.items() if not k.startswith(("snapshot_", "continuation_")) and k != "absent_once"}
+            summary["scope"] = scope
+            write_result = catalog.merge_entries(conn, source_id, result.entries)
+            restricted = 0
+            for entry_id in unverified:
+                restricted += conn.execute("UPDATE entries SET access='restricted' WHERE entry_id=? AND access='standard'",
+                                           (entry_id,)).rowcount
+            if restricted:
+                write_result.entries_updated += restricted
+                write_result.changed = True
+                write_result.catalog_version = catalog.bump_catalog_version(conn)
+            seen = accumulated | write_result.seen_ids
+            if full and result.complete:
+                if existing and len(seen) * 2 < existing and not accept_empty:
+                    raise RecallError("SNAPSHOT_INCOMPLETE", "结果数量突降，旧收藏关系保持不变。")
+                _reconcile_missing(conn, source_id, seen, summary, write_result,
+                                   trusted=connector.trusted, removable=removable,
+                                   verified_collections=verified_collections, accept_empty=accept_empty)
+            if full and result.continuation:
+                summary.update(snapshot_seen=sorted(seen), snapshot_valid=valid,
+                               snapshot_collections=sorted(verified_collections))
+            elif full:
+                for key in ("snapshot_seen", "snapshot_valid", "snapshot_collections"):
+                    summary.pop(key, None)
             counts = write_result.as_counts()
             if result.account_id:
                 _bind_account(conn, source_id, result.account_id)
@@ -150,16 +216,15 @@ def sync_once(
                 "last_success_at": now_iso(),
                 "last_summary": json.dumps(
                     {
+                        **summary,
                         "account_id": result.account_id,
                         "requests_used": result.requests_used,
                         "text": result.summary,
-                        **{k: v for k, v in summary.items() if k != "text"},
                     }, ensure_ascii=False,
                 ),
                 "coverage": result.coverage,
                 "latest_attempt": "partial" if result.warnings else "succeeded",
                 "state": "idle", "failure_count": 0, "next_retry_at": None,
-                "lease_owner": None, "lease_until": None,
             }
             if not full:
                 success_fields["last_incremental_at"] = now_iso()
@@ -185,14 +250,19 @@ def sync_once(
     except RecallError as exc:
         if run_id is None:
             return _failure_body(exc, source_id)
-        return _finish_failure(conn, source_id, run_id, exc, state, owner, started)
+        return _finish_failure(conn, source_id, run_id, exc, state, owner)
     except Exception as exc:
         error = from_exception(exc)
         if run_id is None:
             return _failure_body(error, source_id)
-        return _finish_failure(conn, source_id, run_id, error, state, owner, started)
+        return _finish_failure(conn, source_id, run_id, error, state, owner)
     finally:
-        conn.close()
+        try:
+            resources.close()
+        finally:
+            conn.execute("UPDATE sync_state SET lease_owner=NULL, lease_until=NULL "
+                         "WHERE source_id=? AND lease_owner IN (?,?)", (source_id, owner, "cancelled:" + owner))
+            conn.close()
 
 
 def _bind_account(conn: Any, source_id: str, account_id: str) -> None:
@@ -213,38 +283,25 @@ def _bind_account(conn: Any, source_id: str, account_id: str) -> None:
         )
 
 
-def _two_strike_reconcile(
-    conn: Any,
-    source_id: str,
-    entries: list[Any],
-    started: str,
-    summary: dict[str, Any],
-) -> catalog.WriteResult:
-    """第三方来源：两次成功全量都缺失才把关系标为不可见。"""
-    result = catalog.merge_entries(conn, source_id, entries, mark_missing=False)
-    absent = [
-        row[0] for row in conn.execute(
-            "SELECT e.entry_id FROM entries e JOIN collections c "
-            "ON c.collection_id = e.collection_id "
-            "WHERE c.source_id = ? AND e.active = 1 AND e.last_seen_at < ?",
-            (source_id, started),
-        ).fetchall()
-    ]
-    previous = set(summary.get("absent_once") or [])
-    confirmed = [entry_id for entry_id in absent if entry_id in previous]
+def _reconcile_missing(conn, source_id, seen, summary, result, *, trusted,
+                       removable, verified_collections, accept_empty):
+    rows = conn.execute(
+        "SELECT e.entry_id, e.access, c.access AS collection_access, c.external_key AS collection_key "
+        "FROM entries e JOIN collections c USING(collection_id) WHERE c.source_id=? AND e.active=1",
+        (source_id,),
+    ).fetchall()
+    absent = {row["entry_id"] for row in rows if row["entry_id"] not in seen and (
+        accept_empty or (removable is not None and row["entry_id"] in removable) or
+        (removable is None and (row["collection_key"] in verified_collections or
+         (row["access"] == "standard" and row["collection_access"] == "standard")))
+    )}
+    confirmed = absent if trusted else absent & set(summary.get("absent_once") or [])
     if confirmed:
-        conn.executemany(
-            "UPDATE entries SET active = 0 WHERE entry_id = ?",
-            [(entry_id,) for entry_id in confirmed],
-        )
+        conn.executemany("UPDATE entries SET active=0 WHERE entry_id=?", [(key,) for key in confirmed])
         result.entries_deactivated = len(confirmed)
         result.changed = True
-        catalog.bump_catalog_version(conn)
-    summary["absent_once"] = absent
-    from ..db import catalog_version
-
-    result.catalog_version = catalog_version(conn)
-    return result
+        result.catalog_version = catalog.bump_catalog_version(conn)
+    summary["absent_once"] = sorted(absent)
 
 
 def _finish_failure(
@@ -254,10 +311,10 @@ def _finish_failure(
     exc: RecallError,
     state: dict[str, Any],
     owner: str,
-    started: str,
 ) -> dict[str, Any]:
     failures = int(state.get("failure_count") or 0) + 1
-    next_retry = iso(now() + timedelta(seconds=_backoff(source_id, failures)))
+    delay = max(_backoff(source_id, failures), exc.details.get("retry_after", 0))
+    next_retry = iso(now() + timedelta(seconds=delay))
     new_state = "needs_login" if exc.code in ("AUTH_REQUIRED", "PERMISSION_DENIED") else "error"
     with catalog.transaction(conn):
         current = catalog.get_sync_state(conn, source_id)
@@ -266,7 +323,7 @@ def _finish_failure(
                 conn, source_id,
                 last_error_type=exc.code, last_error_at=now_iso(),
                 latest_attempt="failed", state=new_state, failure_count=failures,
-                next_retry_at=next_retry, lease_owner=None, lease_until=None,
+                next_retry_at=next_retry,
             )
         catalog.finish_run(conn, run_id, "failed", error_code=exc.code)
     return {

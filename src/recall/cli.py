@@ -8,13 +8,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 from typing import Any
 
 from . import catalog, db, ingest, watch
-from .config import default_db_path
 from .db import open_readwrite
-from .errors import RecallError
+from .errors import RecallError, from_exception
 from .media import index_media, run_pending
 from .sources.runner import sync_once
 from .tools import RecallTools
@@ -23,7 +21,7 @@ CONFIG_KEYS = frozenset(
     {
         "account_id", "label", "api_base", "feed_url", "profile_uuid",
         "collection_ids", "board_ids", "collections", "allow_direct_http",
-        "include_collects", "browser_profile",
+        "include_collects", "browser_profile", "daily_request_limit",
     }
 )
 FORBIDDEN_CONFIG_HINTS = ("token", "secret", "cookie", "password", "sessdata", "credential")
@@ -293,7 +291,10 @@ def _run(args: argparse.Namespace) -> int:
         else:
             report = run_pending(args.db, args.limit)
         _emit(report, as_json=args.json)
-        return 0
+        failed = {"failed", "unavailable"}
+        return int(report.get("status") in failed or any(
+            task.get("status") in failed for task in report.get("processed", [])
+        ))
     if cmd == "native-host":
         from .native_host import main as native_main
 
@@ -363,28 +364,14 @@ def _source_command(args: argparse.Namespace) -> int:
             conn.close()
         result = {"source_id": args.source_id, **result}
     _emit(result, as_json=args.json)
-    return 0
+    return 1 if isinstance(result, dict) and result.get("cleanup_pending") else 0
 
 
 def _sync_command(args: argparse.Namespace) -> int:
-    session = None
-    conn = open_readwrite(args.db)
-    try:
-        source = catalog.get_source(conn, args.source_id)
-    finally:
-        conn.close()
-    if source and source["kind"] in BROWSER_KINDS:
-        from .sources.browser import load_session
-
-        session = load_session(args.source_id, source["kind"], args.db)
-    try:
-        report = sync_once(
-            args.db, args.source_id, full=args.full,
-            accept_empty=args.accept_empty, session=session,
-        )
-    finally:
-        if session is not None:
-            session.close()
+    report = sync_once(
+        args.db, args.source_id, full=args.full,
+        accept_empty=args.accept_empty,
+    )
     _emit(report, as_json=args.json, text=f"{report['status']} {report.get('counts', '')}")
     return 1 if report.get("status") == "failed" else 0
 
@@ -402,11 +389,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
-    except Exception:
-        body = RecallError("INTERNAL_ERROR").body
-        print("INTERNAL_ERROR", file=sys.stderr)
+    except Exception as exc:
+        error = from_exception(exc)
         if getattr(args, "json", False):
-            print(json.dumps(body, ensure_ascii=False, indent=2))
+            print(json.dumps(error.body, ensure_ascii=False, indent=2))
+        else:
+            print(f"{error.code}: {error.message}", file=sys.stderr)
         return 1
 
 

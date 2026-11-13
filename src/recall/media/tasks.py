@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import uuid
+from datetime import timedelta
 from typing import Any
 
-from ..clock import now_iso
-from ..db import bump_catalog_version, open_readwrite
+from ..clock import now_iso, now, iso
+from ..catalog import transaction
+from ..db import bump_catalog_version
 from ..textnorm import normalize
 from ..urls import stable_id
 
@@ -15,8 +16,6 @@ OCR_ENGINE_VERSION = "rapidocr-1.4.4"
 ASR_ENGINE_VERSION = "paraformer-sherpa-2.0.1"
 CAPTION_ENGINE_VERSION = "platform-caption-1"
 PARAMS_VERSION = "v1"
-
-SEGMENT_LABELS = {"ocr": "图片识别", "asr": "音频转写", "caption": "平台字幕"}
 
 
 def _digest(data: bytes) -> str:
@@ -27,17 +26,23 @@ def enqueue(
     conn: Any,
     entry_id: str,
     kind: str,
-    data: bytes,
+    data: bytes | None,
     *,
     engine_version: str,
     source_path: str | None = None,
+    digest: str | None = None,
 ) -> tuple[str, bool]:
-    digest = _digest(data)
+    digest = digest or _digest(data or b"")
     task_id = stable_id("tsk", entry_id, kind, digest, engine_version, PARAMS_VERSION)
     existing = conn.execute(
         "SELECT status FROM media_tasks WHERE task_id = ?", (task_id,)
     ).fetchone()
     if existing is not None:
+        if source_path:
+            conn.execute("UPDATE media_tasks SET source_path=? WHERE task_id=? AND status != 'processing'",
+                         (source_path, task_id))
+            conn.execute("UPDATE media_tasks SET status='pending', attempts=0 WHERE task_id=? "
+                         "AND status IN ('failed','unavailable')", (task_id,))
         return task_id, False
     stamp = now_iso()
     conn.execute(
@@ -52,21 +57,40 @@ def enqueue(
     return task_id, True
 
 
-def claim(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT * FROM media_tasks WHERE status IN ('pending','failed') "
-        "AND attempts < 3 ORDER BY created_at LIMIT ?",
-        (limit,),
-    ).fetchall()
-    return [dict(row) for row in rows]
+def pending_ids(conn: Any, limit: int = 10) -> list[str]:
+    conn.execute("UPDATE media_tasks SET status='failed', error_code='WORKER_EXPIRED' "
+                 "WHERE status='processing' AND attempts >= 3 AND updated_at < ?",
+                 (iso(now() - timedelta(seconds=300)),))
+    return [row[0] for row in conn.execute(
+        "SELECT task_id FROM media_tasks WHERE attempts < 3 AND "
+        "(status IN ('pending','failed') OR (status='processing' AND updated_at < ?)) "
+        "ORDER BY created_at, task_id LIMIT ?",
+        (iso(now() - timedelta(seconds=300)), limit),
+    )]
 
 
-def set_status(conn: Any, task_id: str, status: str, *, error_code: str | None = None) -> None:
-    conn.execute(
-        "UPDATE media_tasks SET status = ?, attempts = attempts + 1, "
-        "error_code = ?, updated_at = ? WHERE task_id = ?",
-        (status, error_code, now_iso(), task_id),
-    )
+def claim(conn: Any, limit: int = 10, *, task_id: str | None = None) -> list[dict[str, Any]]:
+    with transaction(conn):
+        ids = [task_id] if task_id else pending_ids(conn, limit)
+        claimed = []
+        for key in ids:
+            changed = conn.execute(
+                "UPDATE media_tasks SET status='processing', attempts=attempts+1, updated_at=? "
+                "WHERE task_id=? AND attempts < 3 AND (status IN ('pending','failed','unavailable') "
+                "OR (status='processing' AND updated_at < ?))",
+                (now_iso(), key, iso(now() - timedelta(seconds=300))),
+            ).rowcount
+            if changed:
+                claimed.append(dict(conn.execute("SELECT * FROM media_tasks WHERE task_id=?", (key,)).fetchone()))
+        return claimed
+
+
+def set_status(conn: Any, task: dict[str, Any], status: str, *, error_code: str | None = None) -> bool:
+    return bool(conn.execute(
+        "UPDATE media_tasks SET status=?, error_code=?, updated_at=? "
+        "WHERE task_id=? AND status='processing' AND attempts=?",
+        (status, error_code, now_iso(), task["task_id"], task["attempts"]),
+    ).rowcount)
 
 
 def write_segments(
@@ -77,7 +101,7 @@ def write_segments(
     access: str,
     segments: list[dict[str, Any]],
 ) -> int:
-    conn.execute("DELETE FROM media_segments WHERE task_id = ?", (task_id,))
+    removed = conn.execute("DELETE FROM media_segments WHERE task_id = ?", (task_id,)).rowcount
     stamp = now_iso()
     for index, segment in enumerate(segments):
         text = str(segment.get("text") or "").strip()
@@ -97,7 +121,7 @@ def write_segments(
     count = conn.execute(
         "SELECT COUNT(*) FROM media_segments WHERE task_id = ?", (task_id,)
     ).fetchone()[0]
-    if count:
+    if count or removed:
         bump_catalog_version(conn)
     return count
 
@@ -116,7 +140,9 @@ def caption_segment(
         engine_version=CAPTION_ENGINE_VERSION,
     )
     if not created:
-        return 0
+        return conn.execute(
+            "SELECT COUNT(*) FROM media_segments WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
     count = write_segments(
         conn, task_id, entry_id, "caption", access,
         [{"text": text, "locator": locator or {}}],

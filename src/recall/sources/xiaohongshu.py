@@ -85,7 +85,7 @@ class XiaohongshuFavoritesConnector(Connector):
             for note in notes:
                 result.entries.append(
                     make_entry(
-                        note["url"], title=note["title"], path=("收藏",),
+                        note["url"], title=note["title"], path=("收藏",), collection_key="xhs:favorites",
                         external_key=note["key"],
                         note=f"type={note['type']}",
                         access="restricted", collection_access="restricted",
@@ -109,7 +109,7 @@ class XiaohongshuFavoritesConnector(Connector):
             for note in notes:
                 result.entries.append(
                     make_entry(
-                        note["url"], title=note["title"], path=("收藏专辑", str(board_id)),
+                        note["url"], title=note["title"], path=("收藏专辑", str(board_id)), collection_key=f"xhs:board:{board_id}",
                         external_key=f"board:{board_id}:{note['key']}",
                         access="restricted", collection_access="restricted",
                     )

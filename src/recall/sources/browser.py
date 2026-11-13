@@ -7,6 +7,7 @@ Playwright 是可选依赖；真人账号验收必须在用户自己的机器上
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -25,9 +26,21 @@ PLATFORM_START = {
 
 
 def profile_dir(source_id: str, db_path: str | Path | None = None) -> Path:
-    root = resolve_db_path(db_path).parent / "browser-profiles"
+    database = resolve_db_path(db_path).resolve()
+    root = database.parent / "browser-profiles"
+    digest = hashlib.sha256((os.path.normcase(str(database)) + "\0" + source_id).encode()).hexdigest()
+    target = root / ("source-" + digest)
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source_id)
-    return root / safe
+    legacy = root / safe
+    if not target.exists() and legacy.is_dir() and not legacy.is_symlink():
+        try:
+            identity = json.loads((legacy / "identity.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            identity = {}
+        # 只有确切的归属标签才允许搬迁，避免标点、大小写碰撞串号。
+        if isinstance(identity, dict) and identity.get("label") == source_id:
+            legacy.rename(target)
+    return target
 
 
 def _playwright():
@@ -51,7 +64,36 @@ def _launch(playwright: Any, directory: Path, *, headless: bool) -> Any:
         return playwright.chromium.launch_persistent_context(str(directory), headless=headless)
 
 
-def connect(
+def connect(source_id: str, kind: str, **options: Any) -> dict[str, Any]:
+    from datetime import timedelta
+    import uuid
+    from .. import catalog
+    from ..clock import now, now_iso, iso
+    from ..db import open_readwrite
+    from ..leases import heartbeat
+
+    db_path = options.get("db_path")
+    conn = open_readwrite(db_path)
+    owner = "login:" + uuid.uuid4().hex
+    try:
+        with catalog.transaction(conn):
+            state = catalog.get_sync_state(conn, source_id)
+            if state.get("lease_owner") and (state.get("lease_until") or "") > now_iso():
+                raise RecallError("DB_BUSY", "该来源正在同步或登录，请稍后重试。")
+            catalog.update_sync_state(conn, source_id, lease_owner=owner,
+                                      lease_until=iso(now() + timedelta(seconds=300)))
+        with heartbeat(db_path, lambda connection: connection.execute(
+            "UPDATE sync_state SET lease_until=? WHERE source_id=? AND lease_owner=?",
+            (iso(now() + timedelta(seconds=300)), source_id, owner),
+        ).rowcount):
+            return _connect(source_id, kind, **options)
+    finally:
+        conn.execute("UPDATE sync_state SET lease_owner=NULL, lease_until=NULL "
+                     "WHERE source_id=? AND lease_owner IN (?,?)", (source_id, owner, "cancelled:" + owner))
+        conn.close()
+
+
+def _connect(
     source_id: str,
     kind: str,
     *,
@@ -103,8 +145,9 @@ def load_session(source_id: str, kind: str, db_path: str | Path | None = None) -
     try:
         context = _launch(playwright, directory, headless=True)
         page = context.pages[0] if context.pages else context.new_page()
+        session = PlaywrightBrowserSession(page, playwright, context, directory)
         page.goto(PLATFORM_START[kind], wait_until="domcontentloaded", timeout=30000)
-        return PlaywrightBrowserSession(page, playwright, context, directory)
+        return session
     except Exception:
         if context is not None:
             context.close()
@@ -122,10 +165,27 @@ class PlaywrightBrowserSession:
         self._directory = directory
         self._douyin_started = False
         self._xhs_started = False
+        self._douyin_identity: dict[str, Any] = {}
+        page.on("response", self._observe_identity)
+
+    def _observe_identity(self, response: Any) -> None:
+        from urllib.parse import urlsplit
+        url = urlsplit(response.url)
+        if url.hostname not in {"www.douyin.com", "www.iesdouyin.com"} or url.path != "/aweme/v1/web/user/profile/self/":
+            return
+        try:
+            payload = response.json()
+            user = payload.get("user", {})
+            if response.ok and payload.get("status_code") == 0 and isinstance(user, dict):
+                self._douyin_identity = {k: str(user[k]) for k in ("uid", "sec_uid") if user.get(k)}
+        except (ValueError, TypeError, AttributeError):
+            return
 
     def close(self) -> None:
-        self._context.close()
-        self._playwright.stop()
+        try:
+            self._context.close()
+        finally:
+            self._playwright.stop()
 
     def youtube_playlists(self) -> tuple[str, list[dict[str, str]]]:
         import hashlib
@@ -207,6 +267,18 @@ class PlaywrightBrowserSession:
     def identity(self) -> dict[str, Any]:
         try:
             identity = json.loads((self._directory / "identity.json").read_text(encoding="utf-8"))
+            if not isinstance(identity, dict):
+                raise RecallError("AUTH_REQUIRED", "登录身份不可用，请重新连接。")
+            from urllib.parse import urlsplit
+            if urlsplit(self.page.url).hostname == "www.douyin.com":
+                if not self._douyin_identity:
+                    self.page.wait_for_timeout(1500)
+                actual = self._douyin_identity
+                if not actual.get("uid"):
+                    raise RecallError("AUTH_REQUIRED", "未观察到抖音本人身份响应，请重新登录；旧收藏保持不变。")
+                if identity.get("user_id") and str(identity["user_id"]) not in actual.values():
+                    raise RecallError("ACCOUNT_MISMATCH", "抖音实际登录账号与填写的用户 ID 不一致。")
+                identity.update(user_id=actual["uid"], sec_uid=actual.get("sec_uid"))
             if "xiaohongshu.com" in self.page.url or "rednote.com" in self.page.url:
                 state_user = self.page.evaluate("""() => {
                     const u = globalThis.__INITIAL_STATE__?.user || {};

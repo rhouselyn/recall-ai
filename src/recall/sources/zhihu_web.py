@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..errors import RecallError
-from .base import Connector, FetchResult, check_budget, make_entry, require_session
+from .base import Connector, FetchResult, check_budget, make_entry, require_session, checkpoint
 
 
 def parse_collection_items(payload: Any) -> tuple[list[dict[str, Any]], bool, int]:
@@ -86,15 +86,22 @@ class ZhihuWebConnector(Connector):
             )
         budget = dict(budget or {})
         budget.setdefault("max_requests", 20)
-        result = FetchResult(coverage="authorized_subset", account_id=account_id)
+        result = FetchResult(coverage="authorized_subset", account_id=account_id, requests_used=1)
         max_pages = 1 if mode == "head" else int(budget.get("max_pages", 50))
         pages = 0
         finished = True
-        for collection in collections:
+        progress = checkpoint(state, mode)
+        start = next((i for i, item in enumerate(collections)
+                      if str(item.get("id") or item.get("url_token")) == str(progress.get("folder_id"))), 0)
+        for index in range(start, len(collections)):
+            collection = collections[index]
             cid = str(collection.get("id") or collection.get("url_token") or "")
             title = str(collection.get("title") or f"收藏夹 {cid}")
             if not cid:
                 continue
+            if pages >= max_pages or result.requests_used + 2 > int(budget["max_requests"]):
+                result.continuation = {"folder_id": cid, "offset": progress.get("offset", 0) if index == start else 0}
+                break
             metadata = session.get_json(f"/api/v4/collections/{cid}")
             result.requests_used += 1
             folder = metadata.get("collection", metadata) if isinstance(metadata, dict) else {}
@@ -103,13 +110,15 @@ class ZhihuWebConnector(Connector):
                 raise RecallError("SOURCE_FORMAT_CHANGED", "无法验证知乎收藏夹所有者。")
             if str(creator["id"]) != account_id:
                 raise RecallError("PERMISSION_DENIED", "该知乎收藏夹不属于当前登录账号。")
-            offset = 0
+            title = str(folder.get("title") or title)
+            offset = int(progress.get("offset", 0)) if mode == "full" and index == start else 0
             seen: set[int] = set()
             while True:
                 if offset in seen:
                     raise RecallError("SOURCE_FORMAT_CHANGED", "知乎夹内分页循环。")
                 seen.add(offset)
                 if pages >= max_pages or not check_budget(result, budget):
+                    result.continuation = {"folder_id": cid, "offset": offset}
                     finished = False
                     break
                 payload = session.get_json(
@@ -125,12 +134,16 @@ class ZhihuWebConnector(Connector):
                     result.entries.append(
                         make_entry(
                             item["url"], title=item["title"], excerpt=item["excerpt"],
-                            path=(title,),
+                            path=(title,), collection_key=f"zhihu:{cid}",
                             external_key=f"collection:{cid}:{item['key']}",
                             access="restricted", collection_access="restricted",
                         )
                     )
                 pages += 1
+                if mode == "head":
+                    following = collections[(index + 1) % len(collections)]
+                    result.continuation = {"folder_id": str(following.get("id") or following.get("url_token")), "offset": 0}
+                    break
                 if is_end:
                     break
                 if next_offset <= offset:
@@ -138,7 +151,7 @@ class ZhihuWebConnector(Connector):
                     finished = False
                     break
                 offset = next_offset
-            if not finished and mode == "head":
+            if result.continuation or not finished:
                 break
         result.complete = False  # 私密范围未自动枚举，保持子集标记
         result.warnings.append("PRIVATE_FAVLISTS_NOT_DISCOVERED")

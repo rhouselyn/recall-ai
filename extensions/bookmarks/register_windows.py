@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -23,12 +24,16 @@ def write_launcher(
 ) -> Path:
     """Windows 的主机清单 path 指向可执行文件；用 .cmd 包装 Python 模块入口。"""
     launcher = manifest_dir / "recall-native-host.cmd"
-    lines = ["@echo off", "setlocal"]
+    if source_id and not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", source_id):
+        raise ValueError("来源 ID 只能包含字母、数字、点、下划线和连字符。")
+    if any(char in str(value) for value in (python_path, db_path or "") for char in ('"', '%', '\n', '\r')):
+        raise ValueError("启动器路径包含不支持的字符。")
+    lines = ["@echo off", "setlocal DisableDelayedExpansion", "chcp 65001 >nul"]
     if db_path:
         lines.append(f'set "RECALL_DB={db_path}"')
     command = f'"{python_path}" -m recall.native_host'
     if source_id:
-        command += f" --source {source_id}"
+        command += f' --source "{source_id}"'
     lines.append(command)
     launcher.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8"))
     return launcher
@@ -39,6 +44,8 @@ def build_manifest(
     launcher: Path,
 ) -> dict:
     origin = f"chrome-extension://{extension_id}/"
+    if not re.fullmatch(r"[a-p]{32}", extension_id):
+        raise ValueError("扩展 ID 必须是浏览器显示的 32 位字母。")
     return {
         "name": HOST_NAME,
         "description": "Recall AI 本地书签写入主机",
@@ -65,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--extension-id", required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--browser", choices=["chrome", "edge", "all"], default="all")
-    parser.add_argument("--source", default=None, help="可选的默认来源 ID")
+    parser.add_argument("--source", default=None, help="可选的固定来源 ID，扩展不能覆盖")
     parser.add_argument("--db", default=None, help="可选地固定 RECALL_DB")
     parser.add_argument("--manifest-out", default=None)
     parser.add_argument("--no-register", action="store_true", help="只生成清单，不写注册表")

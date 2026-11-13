@@ -48,18 +48,6 @@ ACCESSES = frozenset({"standard", "restricted"})
 RUN_MODES = frozenset({"head", "full", "event", "file"})
 REFRESH_MODES = frozenset({"event", "poll", "manual"})
 
-_DEFAULT_KIND_PROVIDER = {
-    "github_stars": "github",
-    "zhihu_api": "zhihu",
-    "zhihu_web": "zhihu",
-    "bilibili_favorites": "bilibili",
-    "xiaohongshu_favorites": "xiaohongshu",
-    "douyin_favorites": "douyin",
-    "youtube_favorites": "youtube",
-    "rss": "rss",
-    "bookmarks_live": "chrome",
-}
-
 
 @dataclass(frozen=True)
 class EntryInput:
@@ -75,10 +63,12 @@ class EntryInput:
     capture: str = "file_import"
     access: str = "standard"
     collection_access: str = "standard"
+    collection_key: str | None = None
 
 
 @dataclass
 class WriteResult:
+    seen_ids: set[str] = field(default_factory=set, repr=False)
     items_added: int = 0
     collections_added: int = 0
     entries_added: int = 0
@@ -146,6 +136,8 @@ def ensure_source(
     remote_account_id: str | None = None,
     config: dict[str, Any] | None = None,
 ) -> str:
+    if conn.execute("SELECT 1 FROM meta WHERE key=?", ("source_cleanup:" + source_id,)).fetchone():
+        raise RecallError("DB_BUSY", "该来源仍有文件待清理，请再次执行 source remove。")
     if not source_id or not source_id.strip():
         raise RecallError("INVALID_ARGUMENT", "source_id 不能为空。")
     if kind not in SOURCE_KINDS:
@@ -289,34 +281,95 @@ def list_sources(
 
 
 def delete_source(conn: sqlite3.Connection, source_id: str) -> dict[str, Any]:
-    """事务删除来源、收藏关系与派生文本；保留仍被其他来源引用的内容项。"""
-    source = get_source(conn, source_id)
-    if source is None:
-        raise RecallError("NOT_FOUND")
+    """删除来源及其独占托管文件；失败的文件清理保留可重试清单。"""
+    from pathlib import Path
+    import shutil
+    from .sources.browser import profile_dir
+    from .config import media_dir
+
+    cleanup_key = "source_cleanup:" + source_id
+    database = conn.execute("PRAGMA database_list").fetchone()[2]
+    root = Path(database).resolve().parent if database else None
     with transaction(conn):
+        source = get_source(conn, source_id)
+        pending = conn.execute("SELECT value FROM meta WHERE key=?", (cleanup_key,)).fetchone()
+        if source is None and pending is None:
+            raise RecallError("NOT_FOUND")
+        state = get_sync_state(conn, source_id)
+        if state.get("lease_owner") and (state.get("lease_until") or "") > now_iso():
+            raise RecallError("DB_BUSY", "来源正在同步或登录，暂不能删除。")
+        from datetime import timedelta
+        from .clock import iso, now
+        active = conn.execute(
+            "SELECT 1 FROM media_tasks t JOIN entries e USING(entry_id) JOIN collections c USING(collection_id) "
+            "WHERE c.source_id=? AND t.status='processing' AND t.updated_at >= ? LIMIT 1",
+            (source_id, iso(now() - timedelta(seconds=300))),
+        ).fetchone()
+        if active:
+            raise RecallError("DB_BUSY", "来源的媒体任务正在运行，暂不能删除。")
+        paths = set(json.loads(pending[0])) if pending else set()
+        if root is not None and source is not None:
+            directory = profile_dir(source_id, database)
+            if directory.exists():
+                paths.add(str(directory))
+            paths.update(row[0] for row in conn.execute(
+                "SELECT t.source_path FROM media_tasks t JOIN entries e USING(entry_id) "
+                "JOIN collections c USING(collection_id) WHERE c.source_id=? AND t.source_path IS NOT NULL",
+                (source_id,),
+            ))
         counts = conn.execute(
-            "SELECT COUNT(*) FROM entries e JOIN collections c "
-            "ON c.collection_id = e.collection_id WHERE c.source_id = ?",
+            "SELECT COUNT(*) FROM entries e JOIN collections c USING(collection_id) WHERE c.source_id=?",
             (source_id,),
         ).fetchone()[0]
-        conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))
+        conn.execute("DELETE FROM sources WHERE source_id=?", (source_id,))
+        conn.execute("DELETE FROM import_runs WHERE source_id=?", (source_id,))
         orphaned = _cleanup_orphan_items(conn)
-        if counts or orphaned:
+        if source is not None:
             bump_catalog_version(conn)
-    return {"entries_removed": counts, "items_removed": orphaned}
-
-
-def remove_source_data(conn: sqlite3.Connection, source_id: str) -> int:
-    """清空某来源的收藏关系（保留来源实例），供快照替换使用。"""
-    rows = conn.execute(
-        "SELECT e.entry_id FROM entries e JOIN collections c "
-        "ON c.collection_id = e.collection_id WHERE c.source_id = ?",
-        (source_id,),
-    ).fetchall()
-    if not rows:
-        return 0
-    conn.executemany("DELETE FROM entries WHERE entry_id = ?", [(r[0],) for r in rows])
-    return len(rows)
+        owned = []
+        if root is not None:
+            shared = {Path(row[0]).resolve() for row in conn.execute(
+                "SELECT source_path FROM media_tasks WHERE source_path IS NOT NULL"
+            )}
+            for value in paths:
+                path = Path(value).resolve()
+                if (path.is_relative_to(media_dir(database)) or
+                        (path.is_relative_to(root / "browser-profiles") and
+                         path == profile_dir(source_id, database).absolute())):
+                    if path not in shared:
+                        owned.append(str(path))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (cleanup_key, _jdump(owned)))
+    # 先提交待清理清单，再动文件；进程中断后可用同一命令继续。
+    retained = paths - set(owned)
+    remaining = []
+    with transaction(conn):
+        shared = {Path(row[0]).resolve() for row in conn.execute(
+            "SELECT source_path FROM media_tasks WHERE source_path IS NOT NULL"
+        )}
+        for value in owned:
+            path = Path(value)
+            if path in shared:
+                retained.add(value)
+                continue
+            if path.resolve() != path:
+                remaining.append(value)
+                continue
+            try:
+                if path.is_dir():
+                    if root is None or not path.is_relative_to(root / "browser-profiles"):
+                        remaining.append(value)
+                        continue
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                remaining.append(value)
+        if remaining:
+            conn.execute("UPDATE meta SET value=? WHERE key=?", (_jdump(remaining), cleanup_key))
+        else:
+            conn.execute("DELETE FROM meta WHERE key=?", (cleanup_key,))
+    return {"entries_removed": counts, "items_removed": orphaned, "cleanup_pending": remaining,
+            "retained_files": sorted(retained)}
 
 
 def _cleanup_orphan_items(conn: sqlite3.Connection) -> int:
@@ -345,21 +398,36 @@ def ensure_collection(
     key = external_key if external_key is not None else collection_external_key(path)
     collection_id = stable_id("col", source_id, key)
     row = conn.execute(
-        "SELECT access FROM collections WHERE collection_id = ?", (collection_id,)
+        "SELECT * FROM collections WHERE source_id = ? AND external_key = ?", (source_id, key)
     ).fetchone()
     if row is not None:
+        collection_id = row["collection_id"]
+        if row["path_json"] != _jdump(list(path)):
+            conn.execute("UPDATE collections SET path_json=? WHERE collection_id=?",
+                         (_jdump(list(path)), collection_id))
+            for entry in conn.execute(
+                "SELECT e.*, i.canonical_url FROM entries e JOIN items i USING(item_id) WHERE collection_id=?",
+                (collection_id,),
+            ).fetchall():
+                conn.execute("UPDATE entries SET search_norm=? WHERE entry_id=?", (
+                    searchable(entry["title"], " ".join(path), entry["excerpt"], entry["note"],
+                               entry["link_url"], entry["canonical_url"]), entry["entry_id"],
+                ))
+            bump_catalog_version(conn)
         # 已受限的夹不因后续写入降级。
         if access == "restricted" and row["access"] != "restricted":
             conn.execute(
                 "UPDATE collections SET access = 'restricted' WHERE collection_id = ?",
                 (collection_id,),
             )
+            bump_catalog_version(conn)
         return collection_id, False
     conn.execute(
         "INSERT INTO collections(collection_id, source_id, external_key, path_json, access) "
         "VALUES(?,?,?,?,?)",
         (collection_id, source_id, key, _jdump(list(path)), access),
     )
+    bump_catalog_version(conn)
     return collection_id, True
 
 
@@ -403,10 +471,12 @@ def upsert_entry(
     """
     if entry.capture not in CAPTURES:
         raise RecallError("INVALID_ARGUMENT", f"未知 capture：{entry.capture}")
+    if entry.access not in ACCESSES:
+        raise RecallError("INVALID_ARGUMENT", "access 只能是 standard 或 restricted。")
     if len(entry.safe.link_url) > 2048:
         raise RecallError("INVALID_ARGUMENT", "链接超出长度上限。")
     collection_id, created_col = ensure_collection(
-        conn, source_id, entry.path, entry.collection_access
+        conn, source_id, entry.path, entry.collection_access, external_key=entry.collection_key
     )
     result.collections_added += int(created_col)
     item_id, created_item = upsert_item(conn, entry.safe)
@@ -414,10 +484,13 @@ def upsert_entry(
 
     external_key = entry.external_key or entry.safe.canonical_url
     entry_id = stable_id("ent", collection_id, external_key)
+    existing = conn.execute(
+        "SELECT * FROM entries WHERE entry_id = ?", (entry_id,)
+    ).fetchone()
     access = _effective_access(entry)
-    title = _prepare_text(entry.title, 300, result, "title")
-    excerpt = _prepare_text(entry.excerpt, 1000, result, "excerpt")
-    note = _prepare_text(entry.note, 1000, result, "note")
+    title = _prepare_text(entry.title or (existing["title"] if existing else None), 300, result, "title")
+    excerpt = _prepare_text(entry.excerpt or (existing["excerpt"] if existing else None), 1000, result, "excerpt")
+    note = _prepare_text(entry.note or (existing["note"] if existing else None), 1000, result, "note")
     stamp = now_iso()
     title_norm = normalize(title)
     search_norm = searchable(
@@ -425,9 +498,6 @@ def upsert_entry(
         entry.safe.link_url, entry.safe.canonical_url,
     )
 
-    existing = conn.execute(
-        "SELECT * FROM entries WHERE entry_id = ?", (entry_id,)
-    ).fetchone()
     if existing is None:
         conn.execute(
             "INSERT INTO entries(entry_id, item_id, collection_id, external_key, title, "
@@ -484,12 +554,15 @@ def merge_entries(
     mark_missing: bool = False,
 ) -> WriteResult:
     """增量合并：只新增或更新，旧条目保持可查。"""
+    entries = list(entries)
     result = WriteResult()
     seen: set[str] = set()
     with transaction(conn):
+        migrate_legacy_collections(conn, source_id, entries)
         for entry in entries:
             entry_id, _ = upsert_entry(conn, source_id, entry, result)
             seen.add(entry_id)
+        result.seen_ids = seen
         if mark_missing:
             rows = conn.execute(
                 "SELECT e.entry_id FROM entries e JOIN collections c "
@@ -512,6 +585,28 @@ def merge_entries(
     return result
 
 
+def migrate_legacy_collections(conn, source_id, entries):
+    """只有一批证据能覆盖旧夹且目标唯一时，沿用旧 ID 保留媒体与引用。"""
+    groups: dict[str, dict[str, set[str]]] = {}
+    for entry in entries:
+        if entry.collection_key is not None:
+            groups.setdefault(collection_external_key(entry.path), {}).setdefault(
+                entry.collection_key, set()).add(entry.external_key or entry.safe.canonical_url)
+    for path_key, targets in groups.items():
+        if len(targets) != 1:
+            continue
+        key, seen = next(iter(targets.items()))
+        old = conn.execute("SELECT collection_id FROM collections WHERE source_id=? AND external_key=?",
+                           (source_id, path_key)).fetchone()
+        if old is None or conn.execute("SELECT 1 FROM collections WHERE source_id=? AND external_key=?",
+                                       (source_id, key)).fetchone():
+            continue
+        existing = {row[0] for row in conn.execute("SELECT external_key FROM entries WHERE collection_id=?",
+                                                  (old[0],))}
+        if existing <= seen:
+            conn.execute("UPDATE collections SET external_key=? WHERE collection_id=?", (key, old[0]))
+
+
 def replace_snapshot(
     conn: sqlite3.Connection,
     source_id: str,
@@ -524,6 +619,8 @@ def replace_snapshot(
 
     异常空快照（已有数据却返回零条）需要用户显式允许。
     """
+    if not complete:
+        raise RecallError("SNAPSHOT_INCOMPLETE", "快照不完整，拒绝替换旧数据。")
     current = conn.execute(
         "SELECT COUNT(*) FROM entries e JOIN collections c "
         "ON c.collection_id = e.collection_id WHERE c.source_id = ? AND e.active = 1",
@@ -537,10 +634,12 @@ def replace_snapshot(
     result = WriteResult()
     try:
         with transaction(conn):
+            migrate_legacy_collections(conn, source_id, entries)
             seen: set[str] = set()
             for entry in entries:
                 entry_id, _ = upsert_entry(conn, source_id, entry, result)
                 seen.add(entry_id)
+            result.seen_ids = seen
             rows = conn.execute(
                 "SELECT e.entry_id, e.active FROM entries e JOIN collections c "
                 "ON c.collection_id = e.collection_id WHERE c.source_id = ?",

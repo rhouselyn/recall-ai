@@ -58,8 +58,14 @@ class _CheckedRedirectHandler(urllib.request.HTTPRedirectHandler):
         self.allowed_hosts = allowed_hosts
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        target = urllib.parse.urlsplit(newurl)
+        origin = urllib.parse.urlsplit(req.full_url)
+        host = (target.hostname or "").lower()
+        target_port = target.port or (443 if target.scheme == "https" else 80)
+        origin_port = origin.port or (443 if origin.scheme == "https" else 80)
+        if (target.scheme not in ("http", "https") or target.username is not None
+                or (origin.scheme == "https" and target.scheme != "https")
+                or (self.allowed_hosts and (host not in self.allowed_hosts or target_port != origin_port))):
             raise RecallError("NETWORK_ERROR", "重定向到未授信主机，已中止。")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -137,7 +143,8 @@ def next_link(header_value: str | None, trusted_host: str) -> str | None:
         if any("rel=\"next\"" in rel or "rel=next" in rel for rel in rels):
             candidate = segments[0][1:-1]
             parsed = urllib.parse.urlsplit(candidate)
-            if parsed.scheme == "https" and (parsed.hostname or "").lower() == trusted_host:
+            if (parsed.scheme == "https" and (parsed.hostname or "").lower() == trusted_host
+                    and parsed.username is None and parsed.password is None and parsed.port in (None, 443)):
                 return candidate
             raise RecallError("NETWORK_ERROR", "分页链接指向未授信主机，已中止。")
     return None

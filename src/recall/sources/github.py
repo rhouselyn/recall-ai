@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..clock import now
 from ..errors import RecallError
-from .base import Connector, FetchResult, check_budget, make_entry
+from .base import Connector, FetchResult, check_budget, make_entry, checkpoint
 from .http import HttpResponse, UrllibHttpClient, next_link
 
 API_HOST = "api.github.com"
@@ -33,6 +34,7 @@ class GitHubStarsConnector(Connector):
         if not token:
             raise RecallError("AUTH_REQUIRED", "同步进程缺少 RECALL_GITHUB_TOKEN。")
         http = self.http or UrllibHttpClient(allowed_hosts=(API_HOST,))
+        self._http = http
         state = state or {}
         result = FetchResult(coverage="authorized_subset")
         headers = {
@@ -40,6 +42,8 @@ class GitHubStarsConnector(Connector):
             "Accept": "application/vnd.github.star+json",
             "X-GitHub-Api-Version": "2026-03-10",
         }
+        self._headers = headers
+        self._budget = budget
 
         user_response = self._get(http, f"{BASE}/user", headers, result)
         self._classify(user_response, check_304=False)
@@ -57,6 +61,9 @@ class GitHubStarsConnector(Connector):
         if etag and mode == "head":
             page_headers["If-None-Match"] = etag
         url: str | None = f"{BASE}/user/starred?per_page=100&page=1"
+        resume = checkpoint(state, mode) if mode == "full" else {}
+        if resume.get("url"):
+            url = next_link(f'<{resume["url"]}>; rel="next"', API_HOST)
         max_pages = 1 if mode == "head" else int((budget or {}).get("max_pages", MAX_PAGES))
         seen_urls: set[str] = set()
         pages = 0
@@ -65,8 +72,8 @@ class GitHubStarsConnector(Connector):
                 raise RecallError("SOURCE_FORMAT_CHANGED", "分页出现循环。")
             seen_urls.add(url)
             if pages >= max_pages:
-                if mode == "full":
-                    raise RecallError("SNAPSHOT_INCOMPLETE", "超过最大页数，未提交半份快照。")
+                break
+            if not check_budget(result, budget):
                 break
             response = self._get(http, url, page_headers, result)
             if response.status_code == 304:
@@ -84,7 +91,9 @@ class GitHubStarsConnector(Connector):
                 if not isinstance(repo, dict) or "id" not in repo or "html_url" not in repo:
                     raise RecallError("SOURCE_FORMAT_CHANGED", "仓库字段不完整。")
                 rid = repo["id"]
-                private = bool(repo.get("private", False))
+                private = repo.get("private")
+                if not isinstance(private, bool):
+                    raise RecallError("SOURCE_FORMAT_CHANGED", "仓库缺少可见性字段。")
                 result.entries.append(
                     make_entry(
                         repo["html_url"],
@@ -99,19 +108,39 @@ class GitHubStarsConnector(Connector):
                 )
                 if len(result.entries) > MAX_ITEMS:
                     raise RecallError("SNAPSHOT_INCOMPLETE", "Stars 超过单次条目上限。")
-            result.etag = response.header("ETag") or result.etag
+            if pages == 0 and not resume:
+                result.etag = response.header("ETag")
             pages += 1
             url = next_link(response.header("Link"), API_HOST)
-            if not check_budget(result, budget):
+            if url and not check_budget(result, budget):
                 break
         result.complete = mode == "full" and url is None
+        if mode == "full" and url:
+            result.continuation = {"url": url}
+            if "BUDGET_EXHAUSTED" not in result.warnings:
+                result.warnings.append("BATCHED_SNAPSHOT")
         result.coverage = "authorized_view" if result.complete else "authorized_subset"
         result.summary = f"{len(result.entries)} stars / {pages} pages"
         return result
 
+    def can_remove(self, entry: dict[str, Any], result: FetchResult) -> bool:
+        # 私库消失不能区分取消收藏与权限丢失；公开库也须再次确认仍可访问。
+        if entry["access"] == "restricted" or not check_budget(result, self._budget):
+            return False
+        key = entry["external_key"]
+        if not key.startswith("repo:") or not key[5:].isdigit():
+            return False
+        response = self._get(self._http, f"{BASE}/repositories/{key[5:]}", self._headers, result)
+        if response.status_code != 200:
+            return False
+        repo = response.json()
+        return isinstance(repo, dict) and str(repo.get("id")) == key[5:] and repo.get("private") is False
+
     def _get(self, http: Any, url: str, headers: dict[str, str], result: FetchResult) -> HttpResponse:
         last: HttpResponse | None = None
         for attempt in range(3):
+            if not check_budget(result, self._budget):
+                raise RecallError("RATE_LIMITED", "本次 GitHub 请求预算已用尽。")
             response = http.request("GET", url, headers=headers, timeout=15.0)
             result.requests_used += 1
             last = response
@@ -131,7 +160,15 @@ class GitHubStarsConnector(Connector):
             status == 403
             and (response.header("Retry-After") or response.header("X-RateLimit-Remaining") == "0")
         ):
-            raise RecallError("RATE_LIMITED", "GitHub 限流，按返回的重试时间退避。")
+            retry_after = 0
+            for header, relative in (("Retry-After", True), ("X-RateLimit-Reset", False)):
+                try:
+                    value = int(response.header(header) or "0")
+                    retry_after = max(retry_after, value if relative else value - int(now().timestamp()))
+                except ValueError:
+                    pass
+            raise RecallError("RATE_LIMITED", "GitHub 限流，按返回的重试时间退避。",
+                              details={"retry_after": retry_after})
         if status == 403:
             raise RecallError("PERMISSION_DENIED", "GitHub 令牌权限不足。")
         if status >= 500:

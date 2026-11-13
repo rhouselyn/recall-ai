@@ -17,6 +17,8 @@ let items = [];
 let nextCursor = null;
 let sourcesInitialized = false;
 let libraryInitialized = false;
+let libraryRequest = 0;
+let librarySearchTimer;
 let sessionToken = "";
 let extensionDir = "";
 let toastTimer;
@@ -36,7 +38,11 @@ async function api(path, body) {
   };
   const response = await fetch(path, options);
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || "请求失败，请重试。");
+  if (!response.ok) {
+    const error = new Error(data.error?.message || "请求失败，请重试。");
+    error.code = data.error?.code;
+    throw error;
+  }
   return data;
 }
 
@@ -90,13 +96,21 @@ function renderAccounts() {
 }
 
 async function renderLibrary(append = false) {
+  const request = ++libraryRequest;
   const params = new URLSearchParams();
   const query = byId("library-query").value.trim();
   const platform = byId("library-source").value;
   if (query) params.set("query", query);
   if (platform) params.set("platform", platform);
   if (append && nextCursor) params.set("cursor", nextCursor);
-  const result = await api("/api/items?" + params);
+  let result;
+  try { result = await api("/api/items?" + params); }
+  catch (error) {
+    if (request !== libraryRequest) return;
+    if (append && error.code === "STALE_CURSOR") return renderLibrary();
+    throw error;
+  }
+  if (request !== libraryRequest) return;
   const updated = append ? items.concat(result.items) : result.items;
   if (libraryInitialized && JSON.stringify(updated) === JSON.stringify(items) && nextCursor === result.next_cursor) return;
   items = updated;
@@ -196,8 +210,10 @@ function errorInDialog(error) {
   else showError(error);
 }
 
-async function showRecord(id) {
-  const data = await api("/api/items/" + encodeURIComponent(id));
+async function showRecord(id, previousEvidence = [], cursor = null) {
+  const data = await api("/api/items/" + encodeURIComponent(id) +
+    (cursor ? "?cursor=" + encodeURIComponent(cursor) : ""));
+  data.evidence = previousEvidence.concat(data.evidence);
   const item = data.item;
   const evidence = data.evidence.map(entry => `
     <p class="dialog-info">${escapeHtml([entry.source_id, ...entry.path].join(" / "))}
@@ -205,9 +221,12 @@ async function showRecord(id) {
   openDialog(`${platformIcon(item.platform)}<h2 id="dialog-title">${escapeHtml(item.title)}</h2>
     <p class="dialog-description">${escapeHtml(item.excerpt || "暂无摘要。")}</p>${evidence}
     <div class="dialog-actions"><a class="secondary" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">打开原文</a>
+    ${data.next_cursor ? '<button class="secondary" type="button" id="more-evidence">加载更多来源</button>' : ""}
     <button class="secondary" type="button" id="extract-media">提取图片或音频文字</button>
     <button class="secondary" type="button" data-close>关闭</button></div>`);
   byId("extract-media").onclick = () => showMedia(item.item_id, data.evidence);
+  if (data.next_cursor) byId("more-evidence").onclick = () =>
+    showRecord(id, data.evidence, data.next_cursor).catch(showError);
 }
 
 function showMedia(itemId, evidence) {
@@ -217,9 +236,10 @@ function showMedia(itemId, evidence) {
     <label class="dialog-field">媒体文件<input type="file" id="media-input" accept="image/*,audio/*,video/*"></label>
     <p class="dialog-error" role="alert"></p><div class="dialog-actions"><button type="button" class="secondary" data-close>取消</button><button type="button" class="primary" id="do-media">开始提取</button></div>`);
   byId("do-media").onclick = async event => {
+    const button = event.currentTarget;
     const file = byId("media-input").files[0];
     if (!file || file.size > 20 * 1024 * 1024) return errorInDialog(new Error("请选择不超过 20 MiB 的媒体文件。"));
-    event.currentTarget.disabled = true;
+    button.disabled = true;
     try {
       const content = await new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -231,7 +251,7 @@ function showMedia(itemId, evidence) {
       const outcome = await waitJob(result.job_id);
       dialog.close();
       showToast(`提取完成，共 ${outcome.segments} 个文字片段`);
-    } catch (error) { errorInDialog(error); event.currentTarget.disabled = false; }
+    } catch (error) { errorInDialog(error); button.disabled = false; }
   };
 }
 
@@ -243,9 +263,10 @@ function showImport(kind = "csv") {
     <p class="dialog-error" role="alert"></p><div class="dialog-actions"><button type="button" class="secondary" data-close>取消</button><button type="button" class="primary" id="do-import">导入</button></div>`);
   byId("import-kind").value = kind;
   byId("do-import").onclick = async event => {
+    const button = event.currentTarget;
     const file = byId("import-input").files[0];
     if (!file || file.size > 20 * 1024 * 1024) return errorInDialog(new Error("请选择不超过 20 MiB 的文件。"));
-    event.currentTarget.disabled = true;
+    button.disabled = true;
     try {
       const content = await new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -257,7 +278,7 @@ function showImport(kind = "csv") {
       dialog.close();
       await refreshSources(); await renderLibrary();
       showToast(`导入${result.status === "partial" ? "部分完成" : "完成"}，新增 ${result.counts.entries_added} 条收藏`);
-    } catch (error) { errorInDialog(error); event.currentTarget.disabled = false; }
+    } catch (error) { errorInDialog(error); button.disabled = false; }
   };
 }
 
@@ -303,21 +324,23 @@ function showAccount(id) {
     <button class="primary" type="button" id="connect-account">${platform.browser ? "导入书签" : "登录并同步"}</button></div>`);
   if (platform.browser) byId("setup-bookmarks").onclick = () => showBookmarksSetup(id);
   byId("connect-account").onclick = async event => {
+    const button = event.currentTarget;
     if (platform.browser) return showImport(id);
-    event.currentTarget.disabled = true;
+    button.disabled = true;
     try {
       const result = await api("/api/connect", { platform: id, token: byId("account-token")?.value || "", user_id: byId("account-user")?.value || "", collections: byId("account-collections")?.value || "" });
       const notes = dialogContent.querySelectorAll(".dialog-info");
       notes[notes.length - 1].textContent = id === "github" ? "正在同步收藏…" : "请在新窗口完成登录，然后关闭窗口。";
       await waitJob(result.job_id);
       await refreshSources(); showAccount(id); showToast("同步完成");
-    } catch (error) { errorInDialog(error); event.currentTarget.disabled = false; await refreshSources(); }
+    } catch (error) { errorInDialog(error); button.disabled = false; await refreshSources(); }
   };
   if (source && !platform.browser) {
     byId("sync-account").onclick = async event => {
-      event.currentTarget.disabled = true;
+      const button = event.currentTarget;
+      button.disabled = true;
       try { const job = await api("/api/sync", { source_id: source.source_id }); await waitJob(job.job_id); await refreshSources(); showAccount(id); showToast("同步完成"); }
-      catch (error) { errorInDialog(error); event.currentTarget.disabled = false; await refreshSources(); }
+      catch (error) { errorInDialog(error); button.disabled = false; await refreshSources(); }
     };
     byId("pause-account").onclick = async () => {
       try { await api(source.sync_state === "paused" ? "/api/resume" : "/api/pause", { source_id: source.source_id }); await refreshSources(); showAccount(id); }
@@ -335,13 +358,14 @@ function showBookmarksSetup(id) {
     <label class="dialog-field">浏览器扩展 ID<input id="extension-id" autocomplete="off" maxlength="32"></label>
     <p class="dialog-error" role="alert"></p><div class="dialog-actions"><button class="secondary" type="button" data-close>关闭</button><button class="primary" type="button" id="register-extension">注册本地主机</button></div>`);
   byId("register-extension").onclick = async event => {
-    event.currentTarget.disabled = true;
+    const button = event.currentTarget;
+    button.disabled = true;
     try {
       const result = await api("/api/bookmarks/register", { platform: browser, extension_id: byId("extension-id").value.trim() });
       await refreshSources();
       dialogContent.querySelector(".dialog-error").textContent = `已注册。请在扩展选项页填写 ${result.source_id} 并保存。`;
-      event.currentTarget.disabled = false;
-    } catch (error) { errorInDialog(error); event.currentTarget.disabled = false; }
+      button.disabled = false;
+    } catch (error) { errorInDialog(error); button.disabled = false; }
   };
 }
 
@@ -366,7 +390,11 @@ question.onkeydown = event => {
     event.preventDefault(); byId("composer").requestSubmit();
   }
 };
-byId("library-query").oninput = () => renderLibrary().catch(showError);
+byId("library-query").oninput = () => {
+  ++libraryRequest;
+  clearTimeout(librarySearchTimer);
+  librarySearchTimer = setTimeout(() => renderLibrary().catch(showError), 200);
+};
 byId("library-source").onchange = () => renderLibrary().catch(showError);
 byId("dialog-close").onclick = () => dialog.close();
 byId("add-link").onclick = showAdd;

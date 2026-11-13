@@ -53,9 +53,13 @@ def pause_source(db_path: str, source_id: str) -> dict[str, Any]:
     try:
         if catalog.get_source(conn, source_id) is None:
             raise RecallError("NOT_FOUND")
-        catalog.update_sync_state(
-            conn, source_id, state="paused", lease_owner=None, lease_until=None
-        )
+        with catalog.transaction(conn):
+            state = catalog.get_sync_state(conn, source_id)
+            owner = state.get("lease_owner")
+            catalog.update_sync_state(
+                conn, source_id, state="paused",
+                lease_owner=(owner if owner.startswith("cancelled:") else "cancelled:" + owner) if owner else None,
+            )
         return {"source_id": source_id, "state": "paused"}
     finally:
         conn.close()
@@ -69,7 +73,7 @@ def resume_source(db_path: str, source_id: str) -> dict[str, Any]:
             raise RecallError("NOT_FOUND")
         catalog.update_sync_state(
             conn, source_id, state="idle", next_retry_at=None,
-            next_run_at=now_iso(), lease_owner=None, lease_until=None,
+            next_run_at=now_iso(),
         )
         return {"source_id": source_id, "state": "idle"}
     finally:
@@ -126,22 +130,15 @@ def run_tick(
             full_due = last_full is None or (
                 current - last_full >= timedelta(seconds=FULL_SECONDS.get(kind, 86400))
             )
-            if kind in {"bilibili_favorites", "youtube_favorites"} and isinstance(summary, dict) and summary.get("continuation_full"):
+            if isinstance(summary, dict) and summary.get("continuation_full"):
                 full_due = True
             budget = {"max_requests": REQUEST_BUDGET.get(kind, 8)}
             if kind == "zhihu_api":
                 budget["max_pages"] = 3
             checked.append(sid)
-            active_session = session
             try:
-                if active_session is None and kind in {
-                    "zhihu_web", "bilibili_favorites",
-                    "xiaohongshu_favorites", "douyin_favorites", "youtube_favorites",
-                }:
-                    from .sources.browser import load_session
-                    active_session = load_session(sid, kind, db_path)
                 results[sid] = sync_once(
-                    db_path, sid, full=full_due, http=http, session=active_session,
+                    db_path, sid, full=full_due, http=http, session=session,
                     env=env, budget=budget,
                 )
             except Exception as exc:
@@ -152,9 +149,6 @@ def run_tick(
                     last_error_type=error.code, last_error_at=now_iso(),
                 )
                 results[sid] = {"source_id": sid, "status": "failed", **error.body}
-            finally:
-                if active_session is not None and active_session is not session:
-                    active_session.close()
             # 休眠唤醒只补一次：无论落后多久，下一轮都从现在重新计时。
             catalog.update_sync_state(
                 conn, sid,
@@ -186,8 +180,9 @@ def watch_forever(
         tick = run_tick(db_path, http=http, session=session, env=env)
         ticks += 1
         aggregate["ticks"] = ticks
-        aggregate["checked"].extend(tick["checked"])
-        aggregate["results"].update(tick["results"])
+        if once or max_ticks is not None:
+            aggregate["checked"].extend(tick["checked"])
+            aggregate["results"].update(tick["results"])
         if once or (max_ticks is not None and ticks >= max_ticks):
             aggregate["catalog_version"] = tick["catalog_version"]
             return aggregate

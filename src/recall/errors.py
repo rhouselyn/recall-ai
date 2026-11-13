@@ -108,7 +108,3 @@ def from_exception(exc: Exception) -> RecallError:
     if isinstance(exc, sqlite3.DatabaseError):
         return RecallError("DB_NOT_READY")
     return RecallError("INTERNAL_ERROR")
-
-
-def translate_sqlite(exc: Exception) -> RecallError:
-    return from_exception(exc)

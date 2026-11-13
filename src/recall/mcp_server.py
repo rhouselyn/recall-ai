@@ -106,7 +106,7 @@ def handle_tool_call(
     tools: RecallTools, name: str, arguments: dict[str, Any] | None
 ) -> dict[str, Any]:
     """纯逻辑入口，可在不安装 SDK 的情况下测试。"""
-    args = arguments or {}
+    args = {} if arguments is None else arguments
     try:
         if name not in ALLOWED_ARGUMENTS:
             raise RecallError("INVALID_ARGUMENT", "未知工具。")
@@ -136,83 +136,37 @@ def handle_tool_call(
 
 
 def _tool_models(types: Any) -> list[Any]:
-    fields = getattr(types.Tool, "model_fields", {})
-    schema_key = "input_schema" if "input_schema" in fields else "inputSchema"
-    result = []
-    for definition in TOOL_DEFINITIONS:
-        payload: dict[str, Any] = {
-            "name": definition["name"],
-            "description": definition["description"],
-            schema_key: definition["inputSchema"],
-        }
-        if "annotations" in fields or "annotations" in getattr(types.Tool, "__fields__", {}):
-            payload["annotations"] = definition["annotations"]
-        result.append(types.Tool(**payload))
-    return result
+    return [types.Tool(
+        name=definition["name"], description=definition["description"],
+        input_schema=definition["inputSchema"], annotations=definition["annotations"],
+    ) for definition in TOOL_DEFINITIONS]
 
 
 def _call_result(types: Any, outcome: dict[str, Any]) -> Any:
-    fields = getattr(types.CallToolResult, "model_fields", {})
-    payload: dict[str, Any] = {
-        "content": [types.TextContent(type="text", text=outcome["text"])]
-    }
-    if "structured_content" in fields:
-        payload["structured_content"] = outcome["structuredContent"]
-    elif "structuredContent" in fields:
-        payload["structuredContent"] = outcome["structuredContent"]
-    if "is_error" in fields:
-        payload["is_error"] = outcome["isError"]
-    elif "isError" in fields:
-        payload["isError"] = outcome["isError"]
-    return types.CallToolResult(**payload)
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=outcome["text"])],
+        structured_content=outcome["structuredContent"], is_error=outcome["isError"],
+    )
 
 
 def build_server(tools: RecallTools) -> Any:
-    """构造官方 SDK 的 low-level Server；协议层无效请求由 SDK 处理。
-
-    兼容官方 SDK v1（装饰器）与 v2（构造器回调）两条稳定线。
-    """
-    import inspect
-
+    """构造已验证的 SDK v2 Server；协议层无效请求由 SDK 处理。"""
     try:
         from mcp.server.lowlevel import Server  # type: ignore
+        import mcp_types as types  # type: ignore
     except ImportError as exc:
         raise RecallError(
             "CONFIG_ERROR", "缺少 MCP SDK：python -m pip install -e '.[mcp]'"
         ) from exc
-    try:
-        import mcp_types as types  # type: ignore  # SDK v2 独立协议类型包
-    except ImportError:
-        from mcp import types  # type: ignore  # SDK v1
+    async def list_tools(ctx: Any, params: Any) -> Any:
+        return types.ListToolsResult(tools=_tool_models(types))
 
-    if "on_list_tools" in inspect.signature(Server.__init__).parameters:
-        # SDK v2：handler 接收 (ctx, params)，直接返回结果模型。
-        async def list_tools_v2(ctx: Any, params: Any) -> Any:
-            return types.ListToolsResult(tools=_tool_models(types))
+    async def call_tool(ctx: Any, params: Any) -> Any:
+        return _call_result(types, handle_tool_call(tools, params.name, params.arguments))
 
-        async def call_tool_v2(ctx: Any, params: Any) -> Any:
-            return _call_result(
-                types, handle_tool_call(tools, params.name, params.arguments or {})
-            )
-
-        return Server(
-            "recall-ai", version="0.2.0",
-            on_list_tools=list_tools_v2, on_call_tool=call_tool_v2,
-        )
-
-    # SDK v1：装饰器注册，返回内容列表。
-    server = Server("recall-ai")
-
-    @server.list_tools()
-    async def list_tools() -> list[Any]:
-        return _tool_models(types)
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[Any]:
-        outcome = handle_tool_call(tools, name, arguments or {})
-        return [types.TextContent(type="text", text=outcome["text"])]
-
-    return server
+    return Server(
+        "recall-ai", version="0.2.0", on_list_tools=list_tools, on_call_tool=call_tool,
+    )
 
 
 def main() -> int:

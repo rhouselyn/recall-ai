@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import tempfile
 import threading
@@ -16,7 +17,8 @@ from recall.web import RecallServer
 class WebTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.server = RecallServer(0, str(Path(self.tmp.name) / "recall.db"))
+        with patch("recall.web.load_secret", return_value=None):
+            self.server = RecallServer(0, str(Path(self.tmp.name) / "recall.db"))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -53,8 +55,36 @@ class WebTestCase(unittest.TestCase):
             })
         self.assertEqual(forbidden.exception.code, 403)
 
+    def test_invalid_post_data_is_reported_without_tracebacks(self):
+        import io
+        from contextlib import redirect_stderr
+        headers = {"X-Recall-Token": self.server.token}
+        invalid = [
+            ("/api/chat", {"text": 7}),
+            ("/api/chat", {"text": "search", "history": [{"role": "user", "text": []}]}),
+            ("/api/import", {"kind": "csv", "content": "invalid!"}),
+            ("/api/media", {"filename": "test.png", "content": "invalid!"}),
+        ]
+        log = io.StringIO()
+        for path, payload in invalid:
+            with self.subTest(path=path), redirect_stderr(log), self.assertRaises(HTTPError) as raised:
+                self.request(path, payload, **headers)
+            self.assertEqual(json.load(raised.exception)["error"]["code"], "INVALID_ARGUMENT")
+        self.assertEqual(log.getvalue(), "")
+
+    def test_item_evidence_supports_next_page(self):
+        from recall.ingest import add_link
+        for index in range(51):
+            add_link(self.server.db_path, "https://example.com/shared", "manual", "web", collection=str(index))
+        item = self.request("/api/items")["items"][0]
+        first = self.request("/api/items/" + item["item_id"])
+        second = self.request("/api/items/" + item["item_id"] + "?cursor=" + first["next_cursor"])
+        self.assertEqual((len(first["evidence"]), len(second["evidence"])), (50, 1))
+        self.assertIsNone(second["next_cursor"])
+
 
 class MediaRegressionTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("numpy"), "optional media dependency: numpy")
     def test_small_decoder_frames_are_combined_before_asr(self):
         import sys
         import types

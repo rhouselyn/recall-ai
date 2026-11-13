@@ -55,7 +55,7 @@ class YouTubeFavoritesConnector(Connector):
                     continue
                 result.entries.append(make_entry(
                     f"https://www.youtube.com/watch?v={video_id}", title=video.get("title"),
-                    path=(playlist["title"],), external_key=f"youtube:{video_id}",
+                    path=(playlist["title"],), collection_key=f"youtube:{playlist['id']}", external_key=f"youtube:{video_id}",
                     access="restricted", collection_access="restricted"))
         if failures and not successes and not result.continuation:
             raise first_error or RecallError("NETWORK_ERROR", "无法读取 YouTube 播放列表。")
