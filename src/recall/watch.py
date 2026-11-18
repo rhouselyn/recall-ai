@@ -14,9 +14,11 @@ from . import catalog
 from .clock import iso, now, now_iso
 from .db import open_readwrite
 from .errors import RecallError, from_exception
+from .ingest import import_local_bookmarks
 from .sources.runner import sync_once
 
 POLL_SECONDS: dict[str, int] = {
+    "bookmarks_html": 15,
     "github_stars": 90,
     "bilibili_favorites": 120,
     "zhihu_api": 600,
@@ -104,8 +106,8 @@ def run_tick(
     results: dict[str, Any] = {}
     try:
         rows = conn.execute(
-            "SELECT source_id, kind, refresh_mode, sync_enabled FROM sources "
-            "WHERE sync_enabled = 1 AND refresh_mode = 'poll' ORDER BY source_id"
+            "SELECT source_id, kind, provider FROM sources "
+            "WHERE sync_enabled = 1 AND refresh_mode = 'poll' ORDER BY kind!='bookmarks_html', source_id"
         ).fetchall()
         current = now()
         for row in rows:
@@ -137,10 +139,13 @@ def run_tick(
                 budget["max_pages"] = 3
             checked.append(sid)
             try:
-                results[sid] = sync_once(
-                    db_path, sid, full=full_due, http=http, session=session,
-                    env=env, budget=budget,
-                )
+                if kind == "bookmarks_html" and sid == f"{row['provider']}-local" and row["provider"] in ("chrome", "edge"):
+                    results[sid] = import_local_bookmarks(db_path, row["provider"], poll=True)
+                else:
+                    results[sid] = sync_once(
+                        db_path, sid, full=full_due, http=http, session=session,
+                        env=env, budget=budget,
+                    )
             except Exception as exc:
                 error = from_exception(exc)
                 catalog.update_sync_state(
@@ -149,6 +154,8 @@ def run_tick(
                     last_error_type=error.code, last_error_at=now_iso(),
                 )
                 results[sid] = {"source_id": sid, "status": "failed", **error.body}
+            if results[sid].get("reason") == "lease":
+                continue
             # 休眠唤醒只补一次：无论落后多久，下一轮都从现在重新计时。
             catalog.update_sync_state(
                 conn, sid,
@@ -171,13 +178,25 @@ def watch_forever(
     http: Any = None,
     session: Any = None,
     env: dict[str, str] | None = None,
+    archive_links: bool = False,
 ) -> dict[str, Any]:
     """前台持续运行；``once=True`` 用于固定时钟模拟与验收。"""
     wait = sleeper or time.sleep
     ticks = 0
+    semantic_due = 0
     aggregate = {"ticks": 0, "checked": [], "results": {}}
     while True:
         tick = run_tick(db_path, http=http, session=session, env=env)
+        if archive_links:
+            from .semantic import index_pending
+            from .media.archive import run_archive_tick
+
+            run_archive_tick(db_path)
+            if time.monotonic() >= semantic_due:
+                try:
+                    index_pending(db_path)
+                except Exception:
+                    semantic_due = time.monotonic() + 60
         ticks += 1
         aggregate["ticks"] = ticks
         if once or max_ticks is not None:

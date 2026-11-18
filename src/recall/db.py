@@ -138,6 +138,30 @@ CREATE TABLE IF NOT EXISTS media_segments (
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_segments_entry ON media_segments(entry_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_entry_kind ON media_tasks(entry_id, kind);
+CREATE TABLE IF NOT EXISTS segment_vectors (
+    segment_id TEXT PRIMARY KEY REFERENCES media_segments(segment_id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    vectors BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_segment_vectors_model ON segment_vectors(model);
+"""
+
+SEGMENT_FTS = """
+CREATE VIRTUAL TABLE segment_fts USING fts5(
+    search_norm, content='media_segments', content_rowid='rowid', tokenize='trigram'
+);
+INSERT INTO segment_fts(segment_fts) VALUES('rebuild');
+CREATE TRIGGER segment_fts_insert AFTER INSERT ON media_segments BEGIN
+    INSERT INTO segment_fts(rowid, search_norm) VALUES(new.rowid, new.search_norm);
+END;
+CREATE TRIGGER segment_fts_delete AFTER DELETE ON media_segments BEGIN
+    INSERT INTO segment_fts(segment_fts, rowid, search_norm) VALUES('delete', old.rowid, old.search_norm);
+END;
+CREATE TRIGGER segment_fts_update AFTER UPDATE OF search_norm ON media_segments BEGIN
+    INSERT INTO segment_fts(segment_fts, rowid, search_norm) VALUES('delete', old.rowid, old.search_norm);
+    INSERT INTO segment_fts(rowid, search_norm) VALUES(new.rowid, new.search_norm);
+END;
 """
 
 
@@ -200,6 +224,14 @@ def init_db(path: str | Path | None = None, *, backup_on_upgrade: bool = True) -
             backup_db(target, auto)
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(DDL)
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='segment_fts'").fetchone():
+            try:
+                conn.executescript("BEGIN IMMEDIATE;\n" + SEGMENT_FTS + "\nCOMMIT;")
+            except sqlite3.OperationalError as exc:
+                if conn.in_transaction:
+                    conn.rollback()
+                if not any(reason in str(exc) for reason in ("no such module", "no such tokenizer", "already exists")):
+                    raise
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('catalog_version', '0')")
         if version != SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

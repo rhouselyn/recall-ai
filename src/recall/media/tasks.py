@@ -18,6 +18,21 @@ CAPTION_ENGINE_VERSION = "platform-caption-1"
 PARAMS_VERSION = "v1"
 
 
+def text_chunks(text: str, kind: str) -> list[dict[str, Any]]:
+    text = "\n".join(line.strip() for line in text[:350_000].splitlines() if line.strip())
+    chunks = []
+    offset = 0
+    while offset < len(text):
+        end = min(offset + 900, len(text))
+        if end < len(text):
+            boundary = text.rfind("\n", offset + 600, end)
+            if boundary >= 0:
+                end = boundary + 1
+        chunks.append({"kind": kind, "text": text[offset:end], "locator": {"part": len(chunks) + 1}})
+        offset = end
+    return chunks
+
+
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -59,10 +74,10 @@ def enqueue(
 
 def pending_ids(conn: Any, limit: int = 10) -> list[str]:
     conn.execute("UPDATE media_tasks SET status='failed', error_code='WORKER_EXPIRED' "
-                 "WHERE status='processing' AND attempts >= 3 AND updated_at < ?",
+        "WHERE kind != 'archive' AND status='processing' AND attempts >= 3 AND updated_at < ?",
                  (iso(now() - timedelta(seconds=300)),))
     return [row[0] for row in conn.execute(
-        "SELECT task_id FROM media_tasks WHERE attempts < 3 AND "
+        "SELECT task_id FROM media_tasks WHERE kind != 'archive' AND attempts < 3 AND "
         "(status IN ('pending','failed') OR (status='processing' AND updated_at < ?)) "
         "ORDER BY created_at, task_id LIMIT ?",
         (iso(now() - timedelta(seconds=300)), limit),
@@ -113,7 +128,7 @@ def write_segments(
             "INSERT OR IGNORE INTO media_segments(segment_id, entry_id, task_id, kind, "
             "text, locator_json, access, search_norm, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
             (
-                segment_id, entry_id, task_id, kind, text,
+                segment_id, entry_id, task_id, segment.get("kind", kind), text,
                 json.dumps(locator, ensure_ascii=False), access,
                 normalize(text), stamp,
             ),

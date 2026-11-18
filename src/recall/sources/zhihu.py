@@ -30,6 +30,24 @@ def _check_code(payload: Any) -> None:
     raise RecallError("SOURCE_FORMAT_CHANGED", "知乎返回未知业务状态码。")
 
 
+def read_body(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        from lxml.html import fragment_fromstring
+    except ImportError:
+        return None
+    from lxml.etree import LxmlError
+
+    try:
+        tree = fragment_fromstring(value[:350_000].replace("\x00", ""), create_parent=True)
+    except (LxmlError, ValueError):
+        return None
+    for node in tree.xpath(".//script|.//style"):
+        node.drop_tree()
+    return " ".join(text.strip() for text in tree.itertext() if text.strip())
+
+
 def content_fields(item: dict[str, Any]) -> dict[str, Any]:
     """从官方文档允许的字段里提取需要的内容；不保存完整响应。"""
     content = item.get("Content") if isinstance(item.get("Content"), dict) else item
@@ -43,6 +61,7 @@ def content_fields(item: dict[str, Any]) -> dict[str, Any]:
         "url": url, "title": title, "id": identifier,
         "saved_at": item.get("FavTime") or item.get("fav_time"),
         "excerpt": content.get("Description") or content.get("Excerpt"),
+        "body": read_body(content.get("HtmlContent") or content.get("html_content")),
     }
 
 
@@ -134,7 +153,7 @@ class ZhihuApiConnector(Connector):
                     result.entries.append(
                         make_entry(
                             fields["url"], title=fields["title"],
-                            excerpt=fields["excerpt"], saved_at=fields["saved_at"],
+                            excerpt=fields["excerpt"], saved_at=fields["saved_at"], body=fields["body"],
                             path=(str(title),), collection_key=f"zhihu:{token}",
                             external_key=f"fav:{token}:{fields['id']}",
                         )

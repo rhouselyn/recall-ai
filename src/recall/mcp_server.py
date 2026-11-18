@@ -1,7 +1,7 @@
 """MCP stdio 服务（开发规格 §6 / R05）。
 
 只暴露四个只读工具；``RECALL_ALLOWED_SOURCES`` 必须由用户明确配置，
-缺省即启动失败；默认不开放 restricted。正常结果带 structuredContent，
+缺省即启动失败；仅允许范围内的 restricted 默认可读。正常结果带 structuredContent，
 同时保留文本结果以兼容需要文本的客户端；工具执行错误使用 isError。
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "recall_search",
-        "description": "在本地已入库的收藏里按关键词、来源、平台、收藏夹和时间查询。",
+        "description": "默认混合关键词和本地向量检索。可直接输入自然语言问题；返回匹配原文片段及来源。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -59,6 +59,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "saved_before": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                 "cursor": {"type": "string"},
+                "mode": {"type": "string", "enum": ["hybrid", "keyword"], "default": "hybrid"},
             },
             "additionalProperties": False,
         },
@@ -66,7 +67,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "recall_get_item",
-        "description": "查看某个内容项的详情与全部可见来源证据。",
+        "description": "查看收藏详情、来源、归档状态和可见的内容片段。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -116,6 +117,8 @@ def handle_tool_call(
         missing = REQUIRED_ARGUMENTS[name] - set(args)
         if unknown or missing:
             raise RecallError("INVALID_ARGUMENT", "工具参数无效。")
+        if name == "recall_search" and "mode" not in args:
+            args = {**args, "mode": "hybrid"}
         result = getattr(tools, name)(**args)
         text = json.dumps(result, ensure_ascii=False)
         return {"structuredContent": result, "text": text, "isError": False}

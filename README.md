@@ -11,7 +11,7 @@
 两个明确的边界：
 
 - **只找你自己的东西**：搜索只覆盖已导入或已同步的数据，不混入平台全站搜索；条目只有元数据时，结果也只是元数据。
-- **收藏存储在本机**：使用 DeepSeek 时，会发送你的问题、最近对话和检索到的相关收藏片段；使用本地 Ollama 时，这些内容留在本机。
+- **收藏存储在本机**：使用 DeepSeek 时，会发送你的问题和命中的非受限收藏片段；使用本地 Ollama 时，问答数据留在本机。
 
 ## 功能特性
 
@@ -21,7 +21,7 @@
 - **本地媒体识别**：图片 OCR、音频/视频转写，片段参与检索（可选组件）
 - **MCP 服务**：暴露四个只读工具，可接入任何支持 MCP 的 AI 客户端（如 Claude Desktop）
 - **浏览器扩展**：Chrome / Edge 书签变动实时同步（Manifest V3 + native messaging）
-- **定时自动同步**：`recall watch` 前台常驻，按来源调度刷新
+- **定时自动同步与归档**：服务运行时刷新来源、补全可读正文和字幕；也可使用 `recall watch`
 - **备份与恢复**：SQLite 在线备份接口，升级前自动备份
 
 ## 快速开始
@@ -30,12 +30,12 @@ Windows（首验环境，PowerShell）：
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[browser,media,youtube]"
+.\.venv\Scripts\python.exe -m pip install -e ".[browser,media,archive,semantic,mcp]"
 .\.venv\Scripts\python.exe -m recall init
 .\.venv\Scripts\python.exe -m recall serve
 ```
 
-打开 http://127.0.0.1:8765 即是网页工作台；也可以双击 `启动 Recall AI.bat`。服务运行时自动刷新已启用的账号来源。
+打开 http://127.0.0.1:8765 即是网页工作台；也可以双击 `启动 Recall AI.bat`。服务运行时会刷新已启用的账号来源，并逐条补全收藏内容。
 
 最短路径：网页里导入一份 Chrome/Edge 书签 HTML，然后在搜索框里搜点什么；或者在「账号连接」里发起平台登录同步。
 
@@ -47,7 +47,9 @@ py -3.11 -m venv .venv
 python -m pip install -e .             # 只用 CLI / Python 即可
 python -m pip install -e ".[mcp]"      # 需要 MCP stdio
 python -m pip install -e ".[browser]"  # 需要登录网页连接器
-python -m pip install -e ".[youtube]"  # 需要 YouTube 播放列表连接器（另需 browser）
+python -m pip install -e ".[archive]"  # 自动归档正文和字幕；包含 yt-dlp
+python -m pip install -e ".[semantic]" # 本地向量语义检索
+python -m pip install -e ".[youtube]"  # 仅需要 yt-dlp 时使用；同步播放列表另需 browser
 python -m pip install -e ".[media]"    # 需要本地 OCR / ASR
 ```
 
@@ -67,9 +69,22 @@ python -m pip install -e ".[media]"    # 需要本地 OCR / ASR
 
 `recall serve`（或双击 `启动 Recall AI.bat`）后访问 http://127.0.0.1:8765：
 
-- **搜索 / 对话**：主界面即搜即问；已配置 DeepSeek 密钥时，对话会发送问题、最近对话和检索片段。未配置密钥时尝试本地 Ollama；模型调用失败则返回本地检索结果。密钥通过 `DEEPSEEK_API_KEY` 配置。
-- **账号连接**：GitHub 填只读 PAT；网页平台在页面里发起登录和同步（需要本机 Chrome 或 Playwright 安装的 Chromium）；部分平台需填写本人用户 ID，知乎私密夹还需收藏夹 ID。平台页面和第三方接口会变动，实际可读范围以同步结果为准。
-- **媒体识别**：选择本地图片、音频或视频进行识别，单个文件上限 20 MiB；媒体副本保存在数据库所在目录的 `media` 子目录，更大的文件走 CLI。
+- **搜索 / 对话**：在标题、摘要和归档片段中检索，回答显示编号来源和命中的片段。有私密命中时默认改用本地 Ollama，不向 DeepSeek 发送问题或私密证据。只有公共命中时可用已配置的 DeepSeek；模型不可用或没有正文时仍显示本地检索结果。
+- **账号连接**：点「一键打开待登录网页」，可同时打开待登录的 B 站、抖音、小红书、知乎和 YouTube 窗口（需本机 Chrome 或 Playwright 安装的 Chromium）。逐个完成扫码或登录并关闭窗口，即会开始同步。通常无需填写用户 ID；知乎只发现网页可见的本人收藏夹，缺失时可补填 `/collection/` 后的数字。
+- **浏览器书签**：在 Chrome 或 Edge 卡片中选择「启用本机自动扫描」，Recall 运行时约每 15 秒检查 Windows 默认资料目录（含 Edge Dev）下的书签文件。不需要扩展，不读取登录会话，也不写回浏览器。扫描只合并，删除和移动不会清除旧记录；需要事件推送和完整快照对账时，可选用扩展。
+- **GitHub Stars**：在 GitHub 卡片打开接入指南，从 GitHub 生成细粒度 PAT，授予只读 `Starring` 和仓库 `Metadata` 权限后粘贴并验证。只会同步当前令牌能访问的仓库。
+
+### 自动归档和收藏问答
+
+安装 `.[archive]` 后，重启 `recall serve`（只用命令行也可运行 `recall watch`）。后台会逐条补全新旧收藏；入库后无需点击提取。打开收藏详情，选择「查看已提取内容」阅读归档全文，或在失败和部分完成时重试。只保存文本，不保存原始网页或整个视频。本地单文件提取仍可用 CLI `recall media index`。
+
+- 网页用 Trafilatura 提取正文。知乎同步接口直接返回正文时优先使用它；GitHub 公开仓库优先归档 README。小红书收藏使用已绑定的隔离登录会话读取笔记正文，按私密证据入库；视频的笔记正文不等于字幕。其他网页不重用浏览器 Cookie，不访问内网地址或绕过权限。
+- 视频用 yt-dlp 从支持的原始视频页读取字幕，档案带时间定位；可用字幕优先，没有时保留简介并标记为部分归档。YouTube 部分内容需 [yt-dlp 支持的 JavaScript 运行时](https://github.com/yt-dlp/yt-dlp/wiki/EJS)。
+- B 站账号收藏优先复用登录会话读当前分 P 的平台字幕；无可用字幕且有合适音轨时，自动尝试本地转写（需 `.[media]` 和已配置的本地模型）。回答和 MCP 中的时间链接可跳到原视频，登录会话取到的文本按受限证据保存。
+- 要在没有字幕时尝试本地转写，安装 `.[media]`、配置 `RECALL_ASR_MODEL_DIR`，设 `RECALL_ARCHIVE_ASR=1` 后重启。仅处理可直接读取、时长不超过 30 分钟且下载不超过 32 MiB 的媒体，优先下载音轨；临时文件随后删除。
+- 入库的正文、字幕、OCR 和转写同时供网页问答、CLI 及 MCP 使用。安装 `.[semantic]` 后，服务会为新旧片段后台补建向量，用 SQLite FTS5 关键词结果与向量结果合并排序，引用仍返回原文和来源定位。尚未取到正文的收藏仍可按标题、摘要等关键词检索。
+- 向量由 FastEmbed 的量化多语言 MiniLM 在本机 CPU 生成，首次约需下载 235 MB 模型；问题、私密内容和向量不会发给模型下载服务。不需要 GPU 或单独的向量数据库。模型未就绪、未安装或通过 `RECALL_SEMANTIC=0` 禁用时，关键词检索仍可用。
+- 登录墙、平台限流、无可读正文或字幕时，原收藏仍保留。当前不处理扫描 PDF 或必须运行脚本渲染的通用页面。设 `RECALL_ARCHIVE=0` 可停用后台网络归档，不删除已有片段。只有明确接受向 DeepSeek 发送受限片段和最近聊天历史时，才设 `RECALL_CLOUD_INCLUDE_RESTRICTED=1`。
 
 ### CLI 导入与查询
 
@@ -88,7 +103,7 @@ recall get itm_1 --json
 - HTML 默认合并，`--replace` 表示这是该来源的新完整导出（异常空快照、损坏或截断会拒绝替换）。
 - CSV 是 Recall 通用交换格式（UTF-8，可带 BOM，只有 `url` 必填），永远增量合并。
 - `--platform` 是手动来源的渠道标签，内容平台仍从链接识别。
-- 查询过滤：`--source`（可重复）、`--platform`、`--collection`、`--saved-after`、`--saved-before`、`--limit`、`--cursor`；受限条目需显式 `--include-restricted`。
+- 查询过滤：`--source`（可重复）、`--platform`、`--collection`、`--saved-after`、`--saved-before`、`--limit`、`--cursor`；`--mode keyword` 可只做字面搜索。CLI 受限条目需显式 `--include-restricted`。
 - CLI 失败非零退出，`--json` 模式返回 `{"error":{"code","message","retryable"}}`。
 
 也可以在 Python 里直接用工具层（不依赖任何 Agent 框架）：
@@ -137,7 +152,9 @@ GitHub 和 B 站全量同步会持久保存分页进度与整轮已见证据，�
 
 ### MCP stdio
 
-`RECALL_ALLOWED_SOURCES` 必须由用户明确配置，缺失即启动失败；默认不暴露 `restricted`，可信宿主可显式设置 `RECALL_INCLUDE_RESTRICTED=1`。`pyproject.toml` 的 `[mcp]` 固定使用经 stdio 联调验证的 `mcp==2.3.0`；已有 v1 环境需重新安装 `.[mcp]`。
+网页「设置 → MCP · 本机连接」可按来源生成并复制当前实例的 stdio JSON。客户端运行在同一台机器、使用同一个数据库；配置不包含平台凭据。
+
+`RECALL_ALLOWED_SOURCES` 必须由用户明确配置，缺失即启动失败。配置范围内的私密收藏默认可读；不信任宿主时请从白名单移除敏感来源或显式设 `RECALL_INCLUDE_RESTRICTED=0`，因为宿主可能把结果传给自己的模型。MCP 的 `recall_search` 默认混合检索，可传 `mode: "keyword"` 仅检索原词；服务本身只读，不建索引。让网页服务或 `recall watch` 保持运行完成向量回填。
 
 ```json
 {
@@ -206,7 +223,8 @@ recall source remove old-source --yes
 | `RECALL_OLLAMA_MODEL` | 本地 Ollama 模型 |
 | `RECALL_GITHUB_TOKEN` | GitHub 只读 PAT（Windows 也可 DPAPI 保存） |
 | `RECALL_ALLOWED_SOURCES` | MCP 暴露的来源白名单，逗号分隔，必填 |
-| `RECALL_INCLUDE_RESTRICTED` | `1` 时 MCP 暴露 `restricted` 条目（默认不暴露） |
+| `RECALL_INCLUDE_RESTRICTED` | MCP 的白名单来源默认包含受限条目；设 `0` 排除 |
+| `RECALL_SEMANTIC` | 设 `0` 关闭本地向量索引和检索，不删除已有向量 |
 | `RECALL_ASR_MODEL_DIR` | 本地 ASR 模型目录 |
 
 ## 测试

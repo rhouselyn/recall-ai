@@ -226,9 +226,11 @@ class TransportRegressionTest(unittest.TestCase):
         from recall.web import retrieve
         tools = Mock()
         tools.recall_search.return_value = {"items": [], "coverage": []}
+        tools.semantic_items.return_value = []
         retrieve(tools, "日本市场" * 300, None)
         self.assertLessEqual(tools.recall_search.call_count, 12)
         self.assertTrue(all(len(call.kwargs["query"]) <= 200 for call in tools.recall_search.call_args_list))
+        self.assertLessEqual(len(tools.semantic_items.call_args.args[0]), 400)
 
     def test_missing_visibility_never_becomes_public(self):
         from recall.sources.bilibili import parse_folders

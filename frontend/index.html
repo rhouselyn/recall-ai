@@ -43,6 +43,7 @@
       <button type="button" class="nav-link" data-view="chat" aria-current="page"><svg class="icon"><use href="#i-chat"/></svg>对话</button>
       <button type="button" class="nav-link" data-view="library"><svg class="icon"><use href="#i-bookmark"/></svg>收藏库</button>
       <button type="button" class="nav-link" data-view="accounts"><svg class="icon"><use href="#i-link"/></svg>账号连接</button>
+      <button type="button" class="nav-link" data-view="settings"><svg class="icon"><use href="#i-list"/></svg>设置</button>
     </nav>
     <section class="history" aria-labelledby="history-title">
       <h2 id="history-title">最近对话</h2>
@@ -98,7 +99,7 @@
                 <button type="submit" class="send" aria-label="发送问题" title="发送问题"><svg class="icon"><use href="#i-send"/></svg></button>
               </div>
             </form>
-            <p class="chat-footnote">对话会将问题和相关收藏片段发送至 DeepSeek。点击引用查看来源。</p>
+            <p class="chat-footnote">私密命中默认走本地模型；公开问答可能使用 DeepSeek。点时间戳跳到原视频。</p>
           </section>
 
           <aside class="account-panel" aria-labelledby="account-panel-title">
@@ -114,12 +115,12 @@
 
       <section id="view-library" hidden aria-labelledby="library-title">
         <div class="page-heading">
-          <div><h1 id="library-title">收藏库</h1><p>浏览各个平台的收藏，按来源筛选或搜索标题。</p></div>
+          <div><h1 id="library-title">收藏库</h1><p>入库后自动尝试归档。点击收藏可查看提取的正文或字幕，也可直接搜索这些内容。</p></div>
           <span class="page-emblem" aria-hidden="true"><svg class="icon"><use href="#i-bookmark"/></svg></span>
         </div>
         <div class="library-controls">
           <label class="search-field"><svg class="icon"><use href="#i-search"/></svg><span class="sr-only">搜索收藏</span><input id="library-query" type="search" placeholder="搜索标题、主题或收藏夹"></label>
-          <label class="filter-field"><span>来源</span><select id="library-source"><option value="">全部平台</option></select></label>
+          <label class="filter-field"><span>来源</span><select id="library-source"><option value="">全部来源</option></select></label>
         </div>
         <div class="library-actions"><button type="button" class="secondary" id="add-link">添加链接</button><button type="button" class="secondary" id="import-file">导入收藏</button></div>
         <p class="library-count" id="library-count" aria-live="polite"></p>
@@ -128,11 +129,27 @@
 
       <section id="view-accounts" hidden aria-labelledby="accounts-title">
         <div class="page-heading">
-          <div><h1 id="accounts-title">账号连接</h1><p>选择平台，查看本人收藏的授权方式和连接状态。</p></div>
+          <div><h1 id="accounts-title">来源与同步</h1><p>观察每个平台何时检查、是否需要重新登录，以及哪些来源在自动刷新。</p></div>
           <span class="page-emblem" aria-hidden="true"><svg class="icon"><use href="#i-link"/></svg></span>
         </div>
-        <div class="account-note"><svg class="icon"><use href="#i-lock"/></svg><span>网页账号在本机浏览器中登录，收藏和会话保存在本地。</span></div>
+        <div class="account-note"><svg class="icon"><use href="#i-lock"/></svg><span>只需首次登录。Recall 运行时复用本机登录会话自动检查新收藏；会话过期或平台要求验证时才需重新登录。</span></div>
+        <button class="primary" type="button" id="login-pending">一键打开待登录网页</button>
+        <p class="dialog-info" id="login-progress" role="status" hidden></p>
         <div class="account-list" id="account-list"></div>
+      </section>
+      <section id="view-settings" hidden aria-labelledby="settings-title">
+        <div class="page-heading">
+          <div><h1 id="settings-title">设置</h1><p>把本机收藏库接给其他 Agent。配置只授予读取权限。</p></div>
+        </div>
+        <section class="settings-panel" aria-labelledby="mcp-title">
+          <div class="settings-heading"><div><h2 id="mcp-title">MCP · 本机连接</h2><p>把下方 JSON 粘贴到支持 stdio 的 Agent 客户端 MCP 配置。客户端会启动 Recall 的只读工具进程。</p></div></div>
+          <fieldset><legend>允许查询的来源</legend><div id="mcp-sources" class="mcp-sources"></div></fieldset>
+          <label class="mcp-private"><input id="mcp-private" type="checkbox" checked> 允许所选来源的私密收藏（仅给信任的客户端）</label>
+          <label class="sr-only" for="mcp-config">MCP JSON 配置</label>
+          <textarea id="mcp-config" rows="12" readonly spellcheck="false"></textarea>
+          <div class="settings-actions"><button type="button" class="primary" id="copy-mcp">复制配置</button><span id="mcp-status" role="status"></span></div>
+          <p class="chat-footnote">先选来源。私密片段可能被 Agent 客户端转发给它自己的模型；不信任的客户端请取消勾选。</p>
+        </section>
       </section>
     </div>
   </main>

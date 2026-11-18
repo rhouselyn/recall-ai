@@ -38,6 +38,7 @@ def build_fixture_db(path: Path) -> None:
                 catalog.EntryInput(
                     safe=sanitize_url("https://example.com/probe-item"),
                     title="探针样例条目",
+                    body="这里是一条仅存在于归档正文里的 evidencecobalt 事实。",
                     path=("探针",),
                     saved_at="2026-10-01T00:00:00Z",
                 )
@@ -112,13 +113,16 @@ def main() -> int:
 
         send(proc, {
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "recall_search", "arguments": {"query": "探针", "limit": 5}},
+            "params": {"name": "recall_search", "arguments": {"query": "evidencecobalt", "limit": 5}},
         })
         call = receive(proc, 3)["result"]
         structured = call.get("structuredContent") or call.get("structured_content") or {}
         print("search items:", len(structured.get("items", [])))
         if not structured.get("items"):
             failures.append("structuredContent 里没有命中结果")
+        elif not any("evidencecobalt" in segment["text"]
+                     for segment in structured["items"][0].get("snippets", [])):
+            failures.append("搜索未返回归档正文片段")
         if call.get("isError"):
             failures.append("正常查询被标记为 isError")
         if not call.get("content"):

@@ -70,7 +70,7 @@ def decode_audio_16k(path: str | Path) -> Any:
             yield np.asarray(resampled.to_ndarray(), dtype=np.float32).reshape(-1)
 
 
-def default_asr(path: str | Path) -> list[dict[str, Any]]:
+def default_asr(path: str | Path, *, max_seconds: int | None = None) -> list[dict[str, Any]]:
     model_dir = os.environ.get(ASR_MODEL_DIR_ENV)
     if not model_dir or not Path(model_dir).is_dir():
         raise EngineUnavailable("RECALL_ASR_MODEL_DIR 未配置")
@@ -108,9 +108,13 @@ def default_asr(path: str | Path) -> list[dict[str, Any]]:
                 })
     buffer = np.empty(window, dtype=np.float32)
     used = offset = 0
+    remaining = max_seconds * 16000 if max_seconds is not None else None
     fresh = 0
     for chunk in chunks:
         chunk = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if remaining is not None:
+            chunk = chunk[:remaining]
+            remaining -= len(chunk)
         position = 0
         while position < len(chunk):
             size = min(window - used, len(chunk) - position)
@@ -124,6 +128,8 @@ def default_asr(path: str | Path) -> list[dict[str, Any]]:
                 used = overlap
                 fresh = 0
                 offset += window - overlap
+        if remaining == 0:
+            break
     if fresh:
         recognize(buffer[:used], offset)
     return segments

@@ -7,8 +7,10 @@ HTML 默认合并，``--replace`` 表示该来源的新完整导出；CSV 与单
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import os
 import re
 from dataclasses import dataclass, field, replace as dataclass_replace
 from html import unescape
@@ -314,6 +316,87 @@ def import_bookmarks_html(
     ctx = _ImportContext(source_id)
     text = _read_file(file_path, ctx)
     parser = _parse_bookmarks_html(text)
+    return _import_bookmarks(db_path, ctx, browser, parser.links, parser.folders,
+                             replace=replace, accept_empty=accept_empty)
+
+
+def import_local_bookmarks(db_path: str | Path, browser: str, *, enable_poll=False, poll=False) -> dict[str, Any]:
+    locations = {"chrome": ("Google/Chrome",), "edge": ("Microsoft/Edge", "Microsoft/Edge Dev")}
+    if browser not in locations:
+        raise RecallError("INVALID_ARGUMENT", "请选择 Chrome 或 Edge。")
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        raise RecallError("CONFIG_ERROR", "当前系统不支持自动读取，可改用书签 HTML 导入。")
+    source_id = f"{browser}-local"
+    links: list[dict[str, Any]] = []
+    folders: set[tuple[str, ...]] = set()
+    total_bytes = 0
+    node_count = 0
+    profiles = [(location, path) for location in locations[browser]
+                for path in sorted((Path(local) / location / "User Data").glob("*/Bookmarks"))]
+    if not profiles:
+        raise RecallError("NOT_FOUND", "未在默认位置找到书签，可改用书签 HTML 导入。")
+    digest = hashlib.sha256()
+    snapshot = []
+    for location, file_path in profiles:
+        try:
+            with file_path.open("rb") as stream:
+                content = stream.read(MAX_FILE_BYTES - total_bytes + 1)
+            total_bytes += len(content)
+            if total_bytes > MAX_FILE_BYTES:
+                raise ValueError
+            digest.update(str(file_path).encode() + b"\0" + hashlib.sha256(content).digest())
+            snapshot.append((location, file_path, content))
+        except (OSError, ValueError) as exc:
+            raise RecallError("INVALID_ARGUMENT", "无法读取本地书签或书签超出导入上限；旧收藏已保留。") from exc
+    fingerprint = digest.hexdigest()
+    conn = open_readwrite(db_path)
+    try:
+        state = catalog.get_sync_state(conn, source_id)
+        if poll and (state["state"] == "paused" or catalog.get_source(conn, source_id) is None):
+            return {"status": "skipped"}
+        if poll and state.get("last_etag") == fingerprint and state.get("latest_attempt") != "failed":
+            catalog.update_sync_state(conn, source_id, last_checked_at=now_iso())
+            return {"status": "not_modified"}
+    finally:
+        conn.close()
+    for location, file_path, content in snapshot:
+        try:
+            roots = json.loads(content)["roots"]
+            if not isinstance(roots, dict):
+                raise ValueError
+            prefix = ("Edge Dev", file_path.parent.name) if location.endswith(" Dev") else (file_path.parent.name,)
+            pending = [(node, prefix) for node in reversed(list(roots.values()))]
+            while pending:
+                node, path = pending.pop()
+                node_count += 1
+                if node_count > MAX_ITEMS_PER_IMPORT or len(path) > 64:
+                    raise ValueError
+                name = node["name"]
+                if not isinstance(name, str):
+                    raise ValueError
+                if node["type"] == "folder" and isinstance(node["children"], list):
+                    folder = (*path, name) if name else path
+                    if folder:
+                        folders.add(folder)
+                    pending.extend((child, folder) for child in reversed(node["children"]))
+                elif node["type"] == "url" and isinstance(node["url"], str):
+                    added = node.get("date_added")
+                    stamp = int(added) / 1_000_000 - 11_644_473_600 if (
+                        isinstance(added, str) and re.fullmatch(r"[0-9]{1,18}", added) and int(added)
+                    ) else None
+                    links.append({"href": node["url"], "title": name, "path": path, "add_date": stamp})
+                else:
+                    raise ValueError
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+            raise RecallError("INVALID_ARGUMENT", "无法读取本地书签或书签超出导入上限；可改用 HTML 导入。") from exc
+    return _import_bookmarks(db_path, _ImportContext(source_id), browser, links, folders,
+                             local_fingerprint=fingerprint, enable_poll=enable_poll, poll=poll)
+
+
+def _import_bookmarks(db_path, ctx, browser, links, folders, *, replace=False, accept_empty=False,
+                      local_fingerprint=None, enable_poll=False, poll=False):
+    source_id = ctx.source_id
     conn = open_readwrite(db_path)
     coverage = "complete_export" if replace else "imported_subset"
     run_id = catalog.start_run(conn, source_id, "file", coverage)
@@ -322,7 +405,7 @@ def import_bookmarks_html(
             conn, source_id, "bookmarks_html", browser, coverage=coverage
         )
         entries: list[catalog.EntryInput] = []
-        for link in parser.links:
+        for link in links:
             href = link["href"].strip()
             if href.lower().startswith(PRIVATE_SCHEMES):
                 ctx.counts["excluded_unsafe"] += 1
@@ -351,7 +434,10 @@ def import_bookmarks_html(
         if len(entries) > MAX_ITEMS_PER_IMPORT:
             raise RecallError("INVALID_ARGUMENT", "书签条目超过单次导入上限。")
         with catalog.transaction(conn):
-            _ensure_collections(conn, source_id, parser.folders, ctx)
+            if poll and catalog.get_sync_state(conn, source_id)["state"] == "paused":
+                catalog.finish_run(conn, run_id, "failed", error_code="DB_BUSY")
+                return {"status": "skipped"}
+            _ensure_collections(conn, source_id, folders, ctx)
             if replace:
                 # 结构合法但零条的替换可能是异常空快照，必须显式允许。
                 if not entries and not accept_empty:
@@ -364,22 +450,24 @@ def import_bookmarks_html(
             else:
                 result = catalog.merge_entries(conn, source_id, entries)
             _count_empty_collections(conn, ctx)
-        status = "partial" if ctx.row_errors else "succeeded"
-        state_fields: dict[str, Any] = {
-            "last_checked_at": now_iso(),
-            "last_success_at": now_iso(),
-            "coverage": coverage,
-            "latest_attempt": "partial" if status == "partial" else "succeeded",
-            "state": "idle",
-            "failure_count": 0,
-        }
-        if replace:
-            state_fields["last_full_sync_at"] = now_iso()
-        catalog.update_sync_state(conn, source_id, **state_fields)
-        report = ctx.finish(result, status, coverage, run_id)
-        catalog.finish_run(
-            conn, run_id, status, counts=report["counts"], coverage=coverage
-        )
+            if enable_poll:
+                conn.execute("UPDATE sources SET sync_enabled=1, refresh_mode='poll' WHERE source_id=?", (source_id,))
+            status = "partial" if ctx.row_errors else "succeeded"
+            state_fields: dict[str, Any] = {
+                "last_checked_at": now_iso(),
+                "last_success_at": now_iso(),
+                "coverage": coverage,
+                "latest_attempt": status,
+                "state": "idle",
+                "failure_count": 0,
+            }
+            if replace:
+                state_fields["last_full_sync_at"] = now_iso()
+            if local_fingerprint is not None:
+                state_fields.update(last_etag=local_fingerprint, last_error_type=None)
+            catalog.update_sync_state(conn, source_id, **state_fields)
+            report = ctx.finish(result, status, coverage, run_id)
+            catalog.finish_run(conn, run_id, status, counts=report["counts"], coverage=coverage)
         return report
     except RecallError as exc:
         catalog.finish_run(conn, run_id, "failed", error_code=exc.code)

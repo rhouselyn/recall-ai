@@ -93,6 +93,7 @@ def make_entry(
     collection_access: str = "standard",
     capture: str = "account_sync",
     collection_key: str | None = None,
+    body: str | None = None,
 ) -> catalog.EntryInput:
     safe: SafeUrl = sanitize_url(raw_url)
     return catalog.EntryInput(
@@ -107,6 +108,7 @@ def make_entry(
         collection_access=collection_access,
         capture=capture,
         collection_key=collection_key,
+        body=body,
     )
 
 

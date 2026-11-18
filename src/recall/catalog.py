@@ -64,6 +64,7 @@ class EntryInput:
     access: str = "standard"
     collection_access: str = "standard"
     collection_key: str | None = None
+    body: str | None = None
 
 
 @dataclass
@@ -248,6 +249,7 @@ def source_summary(conn: sqlite3.Connection, source_id: str) -> dict[str, Any]:
         "last_full_sync_at": state.get("last_full_sync_at"),
         "last_error_type": state.get("last_error_type"),
         "next_retry_at": state.get("next_retry_at"),
+        "next_run_at": state.get("next_run_at"),
         "sync_state": state.get("state", "idle"),
         "latest_attempt": state.get("latest_attempt", "never"),
     }
@@ -510,6 +512,7 @@ def upsert_entry(
                 title_norm, search_norm,
             ),
         )
+        _store_source_body(conn, entry, entry_id, access, result)
         result.entries_added += 1
         result.changed = True
         return entry_id, "added"
@@ -528,6 +531,9 @@ def upsert_entry(
         updates["access"] = "restricted"
     if existing["active"] != 1:
         updates["active"] = 1
+    if "link_url" in updates:
+        conn.execute("DELETE FROM media_tasks WHERE entry_id=? AND kind IN ('archive','source_body')", (entry_id,))
+    _store_source_body(conn, entry, entry_id, "restricted" if existing["access"] == "restricted" else access, result)
     # last_seen_at 只是刷新心跳，不影响查询结果，也不能推进目录版本。
     if existing["last_seen_at"] != stamp:
         conn.execute(
@@ -544,6 +550,24 @@ def upsert_entry(
         return entry_id, "updated"
     result.entries_unchanged += 1
     return entry_id, "unchanged"
+
+
+def _store_source_body(conn, entry, entry_id, access, result):
+    if not entry.body:
+        return
+    from .media import tasks
+
+    segments = tasks.text_chunks(entry.body, "article")
+    if not segments:
+        return
+    task_id, created = tasks.enqueue(conn, entry_id, "source_body", entry.body.encode(), engine_version="source-body-1")
+    if not created:
+        return
+    conn.execute("DELETE FROM media_tasks WHERE entry_id=? AND kind IN ('source_body','archive') AND task_id!=?",
+                 (entry_id, task_id))
+    tasks.write_segments(conn, task_id, entry_id, "article", access, segments)
+    conn.execute("UPDATE media_tasks SET status='ready' WHERE task_id=?", (task_id,))
+    result.changed = True
 
 
 def merge_entries(

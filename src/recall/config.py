@@ -51,4 +51,4 @@ def allowed_sources_from_env() -> frozenset[str] | None:
 
 
 def include_restricted_from_env() -> bool:
-    return os.environ.get(INCLUDE_RESTRICTED_ENV) == "1"
+    return os.environ.get(INCLUDE_RESTRICTED_ENV, "1") == "1"

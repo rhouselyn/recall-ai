@@ -74,6 +74,10 @@ h1, h2, p { margin: 0; }
 .hero-index i:last-child { height: 5px; }
 
 .workgrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(264px, 30%); align-items: start; gap: 25px; margin-top: 25px; }
+.has-turns .hero { display: none; }
+.has-turns .workgrid { margin-top: 0; }
+.has-turns .messages { max-height: max(230px, calc(100dvh - 310px)); }
+.composer[aria-busy="true"] .send { opacity: .55; }
 .section-heading, .account-panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .section-heading { margin: 3px 0 18px; }
 .section-heading h2 { font-size: 24px; letter-spacing: -.025em; font-weight: 700; }
@@ -108,7 +112,12 @@ h1, h2, p { margin: 0; }
 .message.user { max-width: 88%; align-self: flex-end; background: #e3eee6; border-color: #dce8de; border-radius: 12px 3px 12px 12px; }
 .message-label { margin-bottom: 6px; font-size: 11px; font-weight: 700; color: #49685a; }
 .message-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.75; }
-.citations { display: flex; flex-wrap: wrap; gap: 7px; padding-top: 12px; }
+.citations { display: grid; gap: 7px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.citations h3 { margin: 0; color: var(--muted); font-size: 12px; }
+.citation-card { overflow-wrap: anywhere; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: #f7faf6; font-size: 13px; }
+.citation-card summary { cursor: pointer; line-height: 1.5; }
+.citation-card summary b { color: var(--pine); }
+.citation-card .citation { margin-top: 8px; }
 .citation { border: 1px solid #d8e8dd; border-radius: 6px; background: #eef5ef; color: #285748; text-align: left; padding: 5px 8px; font-size: 11px; }
 .citation:hover { background: #deede2; }
 
@@ -146,13 +155,30 @@ h1, h2, p { margin: 0; }
 .page-emblem .icon { width: 24px; height: 24px; }
 .account-note { display: flex; align-items: center; gap: 8px; margin: 19px 0; color: #3d6555; background: #eaf2ea; padding: 11px 13px; border-radius: 8px; font-size: 13px; line-height: 1.55; }
 .account-note .icon { width: 16px; height: 16px; }
+.citation-snippet { display: grid; gap: 4px; padding: 7px 0 3px; color: var(--muted); overflow-wrap: anywhere; }
+.citation-snippet a { width: fit-content; color: var(--pine); font-weight: 700; font-variant-numeric: tabular-nums; }
+.citation-snippet span { white-space: pre-wrap; line-height: 1.55; }
+#login-pending { margin-bottom: 12px; }
+#login-progress { white-space: pre-line; }
+.archive-action { margin-top: 8px; }
+.archive-segment + .archive-segment { margin-top: 8px; border-top: 1px solid var(--line); }
 .account-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .account-card { display: flex; flex-direction: column; background: #fdfefc; padding: 15px; border: 1px solid var(--line); border-radius: 12px; }
 .account-card-head, .account-card-footer { display: flex; align-items: center; gap: 9px; }
 .account-card-head .platform, .dialog-inner .platform { width: 39px; height: 39px; border-radius: 10px; }
 .account-card h2 { font-size: 16px; }
-.account-card p { margin: 10px 0 13px; font-size: 13px; line-height: 1.6; color: var(--muted); }
+.account-card p { margin: 3px 0 0; font-size: 13px; line-height: 1.6; color: var(--muted); }
+.sync-meta { display: grid; gap: 5px; margin: 12px 0; padding: 11px 0; border-block: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .account-card-footer { justify-content: space-between; margin-top: auto; }
+.settings-panel { max-width: 830px; margin: 24px 0; padding: 22px; background: white; border: 1px solid var(--line); border-radius: 10px; }
+.settings-heading { display: flex; justify-content: space-between; margin-bottom: 16px; }
+.settings-heading p { margin-top: 8px; color: var(--muted); line-height: 1.6; }
+.settings-panel fieldset { margin: 0 0 10px; padding: 10px; border: 1px solid var(--line); }
+.settings-panel legend { font-weight: 650; }
+.mcp-sources { display: flex; flex-wrap: wrap; gap: 10px 16px; overflow-wrap: anywhere; }
+.mcp-private { display: inline-block; margin: 8px 0; }
+#mcp-config { display: block; width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); font: 12px/1.5 Consolas, monospace; resize: vertical; }
+.settings-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
 .secondary, .primary, .danger { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 7px 11px; border-radius: 7px; font-size: 12px; font-weight: 650; }
 .secondary { border: 1px solid #cadbd0; background: #fff; color: #275c4e; }
 .secondary:hover { background: #eaf3ec; }
@@ -218,7 +244,7 @@ dialog::backdrop { background: #142d28a8; }
   .brand strong { font-size: 23px; }
   .brand small { margin-top: 4px; }
   .new-chat { margin: 0; padding: 0 9px; min-height: 37px; font-size: 12px; }
-  .navigation { grid-column: 1 / -1; grid-template-columns: repeat(3, 1fr); }
+  .navigation { grid-column: 1 / -1; grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .nav-link { justify-content: center; padding: 7px 4px; gap: 6px; font-size: 12px; }
   .nav-link .icon { width: 15px; height: 15px; }
   .history, .sidebar-footer { display: none; }

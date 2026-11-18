@@ -60,6 +60,19 @@ class FakeHttp:
 
 
 class PlatformResponseTest(unittest.TestCase):
+    def test_xiaohongshu_favorites_stay_on_the_logged_in_domain(self):
+        from unittest.mock import Mock
+        from recall.sources.browser import PlaywrightBrowserSession
+
+        page = Mock(url="https://www.xiaohongshu.com/explore")
+        page.evaluate.return_value = [{"id": "note", "noteCard": {"displayTitle": "Saved"}}]
+        session = PlaywrightBrowserSession(page, None, None, None)
+        session.identity = Mock(return_value={"user_id": "me"})
+        result = session._xhs_collection({})
+        page.goto.assert_called_once_with("https://www.xiaohongshu.com/user/profile/me?tab=fav&subTab=note",
+                                          wait_until="domcontentloaded", timeout=30000)
+        self.assertEqual(result["data"]["notes"][0]["note_id"], "note")
+
     def test_rss_last_modified_survives_runner_state(self):
         from recall.sources.rss import RssConnector
         from unittest.mock import Mock
@@ -126,6 +139,21 @@ class PlatformResponseTest(unittest.TestCase):
 
         with self.assertRaises(RecallError):
             ZhihuWebConnector("z", {"collections": [{"id": "12"}]}, session=WrongOwner()).fetch("full")
+
+        class Discovered(Session):
+            def visible_cards(self, selector):
+                return [{"href": href} for href in ("/collection/11", "/collection/12", "https://example.net/collection/13")]
+            def get_json(self, url, **kwargs):
+                if url == "/api/v4/collections/11":
+                    return {"collection": {"creator": {"id": "someone-else"}}}
+                if "/collections/11/items" in url or "/collections/13" in url:
+                    raise AssertionError("Must not read another owner's or an external site's collection")
+                return super().get_json(url, **kwargs)
+
+        discovered = ZhihuWebConnector("z", {}, session=Discovered()).fetch("full")
+        self.assertEqual(len(discovered.entries), 1)
+        self.assertEqual(discovered.coverage, "authorized_subset")
+        self.assertFalse(discovered.complete)
 
     def test_social_favorites_are_restricted(self):
         class Session:
@@ -395,6 +423,15 @@ class SyncTestCase(unittest.TestCase):
         advance(91)
         third = run_tick(str(self.db), http=http, env=self.env)
         self.assertEqual(third["checked"], ["github-personal"])
+
+    def test_watch_does_not_postpone_a_source_busy_archiving(self):
+        with patch("recall.watch.sync_once", return_value={"status": "skipped", "reason": "lease"}):
+            run_tick(str(self.db), env=self.env)
+        conn = open_readwrite(self.db)
+        try:
+            self.assertIsNone(catalog.get_sync_state(conn, "github-personal")["next_run_at"])
+        finally:
+            conn.close()
 
     def test_no_token_fails_without_touching_data(self) -> None:
         failed = sync_once(self.db, "github-personal", http=FakeHttp({}), env={})

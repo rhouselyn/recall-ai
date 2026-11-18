@@ -10,6 +10,7 @@ import json
 import hashlib
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,11 @@ PLATFORM_START = {
     "xiaohongshu_favorites": "https://www.xiaohongshu.com/explore",
     "douyin_favorites": "https://www.douyin.com/user/self",
     "youtube_favorites": "https://www.youtube.com/",
+}
+PLATFORM_LOGIN = {
+    "zhihu_web": "https://www.zhihu.com/signin?next=%2Fpeople%2Fme%2Fcollections",
+    "bilibili_favorites": "https://passport.bilibili.com/login",
+    "youtube_favorites": "https://www.youtube.com/signin?next=%2F",
 }
 
 
@@ -65,6 +71,12 @@ def _launch(playwright: Any, directory: Path, *, headless: bool) -> Any:
 
 
 def connect(source_id: str, kind: str, **options: Any) -> dict[str, Any]:
+    with profile_lease(source_id, options.get("db_path")):
+        return _connect(source_id, kind, **options)
+
+
+@contextmanager
+def profile_lease(source_id: str, db_path, *, purpose="login"):
     from datetime import timedelta
     import uuid
     from .. import catalog
@@ -72,9 +84,8 @@ def connect(source_id: str, kind: str, **options: Any) -> dict[str, Any]:
     from ..db import open_readwrite
     from ..leases import heartbeat
 
-    db_path = options.get("db_path")
     conn = open_readwrite(db_path)
-    owner = "login:" + uuid.uuid4().hex
+    owner = purpose + ":" + uuid.uuid4().hex
     try:
         with catalog.transaction(conn):
             state = catalog.get_sync_state(conn, source_id)
@@ -86,7 +97,9 @@ def connect(source_id: str, kind: str, **options: Any) -> dict[str, Any]:
             "UPDATE sync_state SET lease_until=? WHERE source_id=? AND lease_owner=?",
             (iso(now() + timedelta(seconds=300)), source_id, owner),
         ).rowcount):
-            return _connect(source_id, kind, **options)
+            yield
+            if purpose == "archive" and catalog.get_sync_state(conn, source_id).get("lease_owner") != owner:
+                raise RecallError("DB_BUSY", "浏览器会话任务已取消。")
     finally:
         conn.execute("UPDATE sync_state SET lease_owner=NULL, lease_until=NULL "
                      "WHERE source_id=? AND lease_owner IN (?,?)", (source_id, owner, "cancelled:" + owner))
@@ -112,7 +125,12 @@ def _connect(
         context = _launch(playwright, directory, headless=headless)
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(PLATFORM_START[kind], wait_until="domcontentloaded", timeout=30000)
+            page.goto(PLATFORM_LOGIN.get(kind, PLATFORM_START[kind]),
+                      wait_until="domcontentloaded", timeout=30000)
+            if kind == "xiaohongshu_favorites":
+                login = page.get_by_role("button", name="登录", exact=True)
+                if login.count() == 1 and login.is_visible():
+                    login.click(timeout=3000)
             deadline = time.monotonic() + min(max(wait_seconds, 1), 600)
             while time.monotonic() < deadline and not page.is_closed():
                 try:
@@ -304,6 +322,36 @@ class PlaywrightBrowserSession:
         except (OSError, ValueError) as exc:
             raise RecallError("AUTH_REQUIRED", "登录身份不可用，请重新连接。") from exc
 
+    def xiaohongshu_note_text(self, url: str) -> str:
+        import re
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        note_id = re.fullmatch(r"/(?:explore|discovery/item)/([0-9a-f]+)/?", parts.path)
+        if parts.scheme != "https" or parts.netloc != "www.xiaohongshu.com" or not note_id:
+            raise RecallError("INVALID_ARGUMENT", "不是有效的小红书笔记链接。")
+        from playwright.sync_api import Error
+
+        try:
+            response = self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            page = urlsplit(self.page.url)
+            if self.status() in ("login_required", "expired") or (response and response.status == 401):
+                raise RecallError("AUTH_REQUIRED", "小红书会话已过期，请重新登录。")
+            if response and response.status == 429:
+                raise RecallError("RATE_LIMITED")
+            if self.status() == "captcha" or (response and response.status in (403, 404, 410, 460, 461)):
+                raise RecallError("PERMISSION_DENIED", "小红书未提供该笔记，或需要人工验证。")
+            if response and response.status >= 500:
+                raise RecallError("NETWORK_ERROR")
+            if page.scheme != "https" or page.netloc != parts.netloc or page.path.rstrip("/") != parts.path.rstrip("/"):
+                raise RecallError("PERMISSION_DENIED", "小红书没有打开所选笔记。")
+            return self.page.evaluate("""id => {
+                const note = globalThis.__INITIAL_STATE__?.note?.noteDetailMap?.[id]?.note;
+                return note?.desc?.slice?.(0, 350000) || '';
+            }""", note_id[1])
+        except Error as exc:
+            raise RecallError("NETWORK_ERROR", "无法加载小红书笔记页面。") from exc
+
     def status(self) -> str:
         try:
             url = self.page.url
@@ -332,7 +380,10 @@ class PlaywrightBrowserSession:
             if (!r.ok) return {__status: r.status};
             return await r.json();
         }"""
-        payload = self.page.evaluate(script, target)
+        try:
+            payload = self.page.evaluate(script, target)
+        except Exception as exc:
+            raise RecallError("NETWORK_ERROR", "登录页面暂时无法读取平台响应。") from exc
         if isinstance(payload, dict) and "__status" in payload:
             status = int(payload["__status"])
             if status in (401, 403):
@@ -377,22 +428,30 @@ class PlaywrightBrowserSession:
             raise RecallError("SOURCE_FORMAT_CHANGED", "无法读取抖音收藏页面，请检查登录或页面验证。") from exc
 
     def _xhs_collection(self, params: dict[str, Any]) -> Any:
-        from urllib.parse import quote
+        from urllib.parse import quote, urlsplit
         try:
             cursor = int(params.get("cursor") or 0)
             if not self._xhs_started:
                 user_id = self.identity().get("user_id")
                 if not user_id:
                     raise RecallError("AUTH_REQUIRED", "无法确认小红书登录账号。")
-                target = "https://www.rednote.com/user/profile/" + quote(user_id, safe="") + "?tab=fav&subTab=note"
+                host = urlsplit(self.page.url).hostname
+                if host not in ("www.xiaohongshu.com", "www.rednote.com"):
+                    raise RecallError("AUTH_REQUIRED", "没有可用的小红书登录页面。")
+                target = f"https://{host}/user/profile/" + quote(user_id, safe="") + "?tab=fav&subTab=note"
                 self.page.goto(target, wait_until="domcontentloaded", timeout=30000)
                 self._xhs_started = True
             else:
                 self.page.mouse.wheel(0, 2400)
             self.page.wait_for_timeout(1500)
-            raw = self.page.evaluate("() => globalThis.__INITIAL_STATE__?.user?.notes?._rawValue?.[1] ?? null")
+            raw = self.page.evaluate("""() => {
+                const notes = globalThis.__INITIAL_STATE__?.user?.notes;
+                return (notes?._rawValue ?? notes)?.[1] ?? null;
+            }""")
             if not isinstance(raw, list):
                 raise RecallError("SOURCE_FORMAT_CHANGED", "无法读取小红书收藏页面数据。")
+            if not raw and self.page.locator(".login-container").first.is_visible():
+                raise RecallError("AUTH_REQUIRED", "小红书收藏页要求重新登录。")
             notes = []
             for item in raw[cursor:]:
                 if not isinstance(item, dict) or not isinstance(item.get("noteCard"), dict):

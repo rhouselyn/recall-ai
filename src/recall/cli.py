@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     collections.add_argument("--include-restricted", action="store_true")
     collections.add_argument("--json", action="store_true")
 
-    search = sub.add_parser("search", help="关键词查询或浏览")
+    search = sub.add_parser("search", help="混合检索收藏或浏览")
     search.add_argument("query", nargs="?")
     search.add_argument("--source", action="append", dest="source_ids")
     search.add_argument("--platform")
@@ -164,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--saved-before")
     search.add_argument("--limit", type=int)
     search.add_argument("--cursor")
+    search.add_argument("--mode", choices=("hybrid", "keyword"), default="hybrid")
     search.add_argument("--include-restricted", action="store_true")
     search.add_argument("--json", action="store_true")
 
@@ -241,7 +242,7 @@ def _run(args: argparse.Namespace) -> int:
     if cmd == "watch":
         report = watch.watch_forever(
             args.db, once=args.once, max_ticks=args.ticks,
-            sleep_seconds=args.interval,
+            sleep_seconds=args.interval, archive_links=True,
         )
         _emit(report, as_json=args.json, text=f"ticks={report['ticks']} checked={len(report['checked'])}")
         return 0
@@ -262,6 +263,7 @@ def _run(args: argparse.Namespace) -> int:
                 query=args.query, source_ids=args.source_ids, platform=args.platform,
                 collection_id=args.collection, saved_after=args.saved_after,
                 saved_before=args.saved_before, limit=args.limit, cursor=args.cursor,
+                mode=args.mode,
             )
             if not args.json:
                 lines = [f"{item['title']}  {item['url']}" for item in result["items"]]

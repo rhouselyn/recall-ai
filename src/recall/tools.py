@@ -8,20 +8,24 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import sqlite3
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from contextlib import suppress
 from functools import wraps
 from typing import Any, Iterable, Sequence
 
-from . import catalog
+from . import catalog, semantic
 from .db import catalog_version, open_readonly
 from .errors import RecallError
-from .textnorm import DEFAULT_LIMIT, MAX_LIMIT, like_literal, query_words
+from .textnorm import DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS, MAX_QUERY_WORDS, like_literal, normalize, query_words
 from .urls import display_title, saved_at_iso
 
 PLATFORMS = frozenset(
     {"github", "zhihu", "bilibili", "xiaohongshu", "douyin", "youtube", "web"}
 )
-SEGMENT_LABELS = {"ocr": "图片识别", "asr": "音频转写", "caption": "平台字幕"}
+SEGMENT_LABELS = {"ocr": "图片识别", "asr": "音频转写", "caption": "平台字幕",
+                  "article": "正文", "readme": "仓库 README", "description": "视频简介"}
 MAX_SEARCH_SOURCES = 3
 MAX_SNIPPETS = 3
 MAX_EVIDENCE_SEGMENTS = 5
@@ -99,6 +103,10 @@ class RecallTools:
         )
         self.include_restricted = bool(include_restricted)
         self.db_path = db_path
+        self.segment_fts = False
+        with suppress(sqlite3.OperationalError):
+            conn.execute("SELECT rowid FROM segment_fts WHERE segment_fts MATCH 'recallprobe' LIMIT 1")
+            self.segment_fts = True
 
     # -- 生命周期 ---------------------------------------------------------
     @classmethod
@@ -317,12 +325,18 @@ class RecallTools:
         saved_before: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        mode: str = "keyword",
     ) -> dict[str, Any]:
+        if mode not in ("keyword", "hybrid"):
+            raise RecallError("INVALID_ARGUMENT", "mode 必须是 keyword 或 hybrid。")
         size = self._limit(limit)
         try:
             words, full = query_words(query)
         except ValueError as exc:
-            raise RecallError("INVALID_ARGUMENT", "query 超过长度或词数限制。") from exc
+            if mode != "hybrid" or not isinstance(query, str) or len(query) > MAX_QUERY_CHARS:
+                raise RecallError("INVALID_ARGUMENT", "query 超过长度或词数限制。") from exc
+            full = normalize(query).strip()
+            words = full.split()[:MAX_QUERY_WORDS]
         ids = _as_source_ids(source_ids)
         self._assert_source_ids(ids)
         if platform is not None and (not isinstance(platform, str) or platform not in PLATFORMS):
@@ -340,8 +354,39 @@ class RecallTools:
             "platform": platform, "collection_id": collection_id,
             "saved_after": after, "saved_before": before,
         }
+        generation = None
+        if mode == "hybrid" and query:
+            filters["mode"] = mode
+            version = self.conn.execute("SELECT value FROM meta WHERE key='semantic_version'").fetchone()
+            generation = str(version[0]) if version else "0"
         offset = self._offset("recall_search", filters, cursor)
-        rows = self._matched_rows(words, ids, platform, collection_id, after, before, full, offset, size)
+        if generation is not None and cursor and _decode(cursor).get("g", "0") != generation:
+            raise RecallError("STALE_CURSOR")
+        scope, params = self._search_scope(ids, platform, collection_id, after, before)
+        dense = self._semantic_items(query, scope, params, 50) if generation is not None and words else []
+        keyword_size = 50 if dense else size
+        rows = self._matched_rows(words, scope, params, full, 0 if dense else offset, keyword_size)
+        items, more = self._search_items(rows, words, full, keyword_size)
+        if dense:
+            fused = semantic.fuse(items, dense)
+            items, has_fused_tail = self._paginate(fused, offset, size)
+            if len(items) < size and more:
+                excluded = [item["item_id"] for item in fused]
+                tail_scope = [*scope, "e.item_id NOT IN (" + ",".join("?" for _ in excluded) + ")"]
+                tail_size = size - len(items)
+                tail_rows = self._matched_rows(words, tail_scope, [*params, *excluded], full,
+                                               max(0, offset - len(fused)), tail_size)
+                tail, more = self._search_items(tail_rows, words, full, tail_size)
+                items.extend(tail)
+            else:
+                more = has_fused_tail or more
+        next_cursor = self._cursor("recall_search", filters, offset + size) if more else None
+        if next_cursor and generation is not None:
+            next_cursor = _encode({**_decode(next_cursor), "g": generation})
+        covered = ids if ids is not None else self._visible_source_ids()
+        return {"items": items, "next_cursor": next_cursor, "coverage": self._coverage(covered)}
+
+    def _search_items(self, rows, words, full, size):
         ranked = [(self._rank(row, words, full), row) for row in rows]
         grouped: dict[str, list[tuple[int, sqlite3.Row]]] = {}
         for rank, row in ranked:
@@ -378,12 +423,7 @@ class RecallTools:
                     ),
                 }
             )
-        covered = ids if ids is not None else self._visible_source_ids()
-        return {
-            "items": items,
-            "next_cursor": self._cursor("recall_search", filters, offset + size) if more else None,
-            "coverage": self._coverage(covered),
-        }
+        return items, more
 
     # -- 工具 4 -----------------------------------------------------------
     @_read_snapshot
@@ -426,19 +466,19 @@ class RecallTools:
             "coverage": self._coverage(sorted({r["source_id"] for r in rows})),
         }
 
+    @_read_snapshot
+    def read_archived_content(self, item_id: str, entry_id: str, cursor: str | None = None) -> dict[str, Any]:
+        if not any(row["entry_id"] == entry_id for row in self._item_rows(item_id)):
+            raise RecallError("NOT_FOUND")
+        page_size = 30
+        filters = {"item_id": item_id, "entry_id": entry_id}
+        offset = self._offset("read_archived_content", filters, cursor)
+        segments, more = self._paginate(self._segments(entry_id, limit=page_size + 1, offset=offset), 0, page_size)
+        return {"segments": segments, "next_cursor": self._cursor("read_archived_content", filters, offset + page_size)
+                if more else None}
+
     # -- 内部查询 ---------------------------------------------------------
-    def _matched_rows(
-        self,
-        words: list[str],
-        source_ids: list[str] | None,
-        platform: str | None,
-        collection_id: str | None,
-        after: str | None,
-        before: str | None,
-        full: str,
-        offset: int,
-        limit: int,
-    ) -> list[sqlite3.Row]:
+    def _search_scope(self, source_ids, platform, collection_id, after, before):
         scope_sql, params = self._scope_sql()
         where = ["e.active = 1", scope_sql]
         if source_ids is not None:
@@ -459,15 +499,58 @@ class RecallTools:
         if before is not None:
             where.append("e.saved_at < ?")
             params.append(before)
+        return where, params
+
+    @_read_snapshot
+    def semantic_items(self, query, platform, limit):
+        scope, params = self._search_scope(None, platform, None, None, None)
+        return self._semantic_items(query, scope, params, limit)
+
+    def _semantic_items(self, query, scope, params, limit):
+        if not semantic.enabled():
+            return []
+        predicates = list(scope)
+        if not self.include_restricted:
+            predicates.append("ms.access='standard'")
+        try:
+            rows = self.conn.execute(
+                "SELECT e.item_id, e.entry_id, i.platform, e.title, e.excerpt, e.saved_at, e.link_url, "
+                "c.source_id, c.path_json, c.collection_id, e.capture, "
+                "ms.kind, ms.text, ms.locator_json, ms.created_at, v.vectors "
+                "FROM segment_vectors v JOIN media_segments ms USING(segment_id) "
+                "JOIN entries e USING(entry_id) JOIN items i USING(item_id) "
+                "JOIN collections c USING(collection_id) WHERE v.model=? AND " + " AND ".join(predicates)
+                + " ORDER BY v.segment_id", (semantic.VERSION, *params),
+            )
+            matches = semantic.nearest(rows, query, limit)
+        except (sqlite3.OperationalError, ImportError, OSError, ValueError, RuntimeError):
+            return []
+        return [{
+            "item_id": row["item_id"], "platform": row["platform"],
+            "title": display_title(row["title"], row["link_url"]), "url": row["link_url"],
+            "excerpt": row["excerpt"], "saved_at": row["saved_at"],
+            "sources": [self._evidence_summary(row)], "snippets": [self._segment(row)],
+        } for row in matches]
+
+    def _matched_rows(self, words, scope, scope_params, full, offset, limit):
+        where, params = list(scope), list(scope_params)
         for word in words:
             pattern = like_literal(word)
             segment_scope = "" if self.include_restricted else " AND ms.access = 'standard'"
+            indexed = self.segment_fts and len(word) >= 3 and bool(re.fullmatch(r"[^\W_]+", word))
+            segment_match = (
+                "ms.rowid IN (SELECT rowid FROM segment_fts WHERE segment_fts MATCH ?) "
+                "AND ms.search_norm LIKE ? ESCAPE '\\'" if indexed else "ms.search_norm LIKE ? ESCAPE '\\'"
+            )
             where.append(
                 "(e.search_norm LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM media_segments ms "
-                "WHERE ms.entry_id = e.entry_id AND ms.search_norm LIKE ? ESCAPE '\\'"
+                "WHERE ms.entry_id = e.entry_id AND " + segment_match
                 + segment_scope + "))"
             )
-            params.extend([pattern, pattern])
+            params.append(pattern)
+            if indexed:
+                params.append('"' + word + '"')
+            params.append(pattern)
         title_matches = " AND ".join("instr(e.title_norm, ?) > 0" for _ in words) or "0"
         rank_sql = (
             "CASE WHEN ? != '' AND instr(e.title_norm, ?) > 0 THEN 0 "
@@ -531,29 +614,46 @@ class RecallTools:
             "url": row["link_url"],
         }
 
-    def _segments(self, entry_id: str, words: list[str] | None = None, limit: int = MAX_SNIPPETS) -> list[dict[str, Any]]:
+    def _segments(self, entry_id: str, words: list[str] | None = None, limit: int = MAX_SNIPPETS, *,
+                  offset: int = 0) -> list[dict[str, Any]]:
         sql = (
-            "SELECT kind, text, locator_json FROM media_segments WHERE entry_id = ?"
-            + ("" if self.include_restricted else " AND access = 'standard'")
+            "SELECT ms.kind, ms.text, ms.locator_json, e.link_url, ms.created_at FROM media_segments ms "
+            "JOIN entries e USING(entry_id) WHERE ms.entry_id = ?"
+            + ("" if self.include_restricted else " AND ms.access = 'standard'")
         )
         params: list[Any] = [entry_id]
         if words:
-            sql += " AND (" + " OR ".join("search_norm LIKE ? ESCAPE '\\'" for _ in words) + ")"
+            sql += " AND (" + " OR ".join("ms.search_norm LIKE ? ESCAPE '\\'" for _ in words) + ")"
             params.extend(like_literal(word) for word in words)
-        sql += " ORDER BY segment_id LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY ms.task_id, ms.rowid LIMIT ? OFFSET ?"
+        params.extend((limit, offset))
         rows = self.conn.execute(sql, params).fetchall()
-        result = []
-        for row in rows:
-            result.append(
-                {
-                    "kind": row["kind"],
-                    "label": SEGMENT_LABELS.get(row["kind"], row["kind"]),
-                    "text": row["text"],
-                    "locator": json.loads(row["locator_json"]),
-                }
-            )
-        return result
+        return [self._segment(row) for row in rows]
+
+    @staticmethod
+    def _segment(row):
+        locator = json.loads(row["locator_json"])
+        url = row["link_url"]
+        seek_url = None
+        seconds = locator.get("start_seconds")
+        if isinstance(seconds, (int, float)):
+            parts = urlsplit(url)
+            domain = parts.hostname or ""
+            if domain in ("bilibili.com", "www.bilibili.com", "youtube.com", "www.youtube.com", "youtu.be"):
+                params = dict(parse_qsl(parts.query, keep_blank_values=True))
+                params["t"] = str(int(seconds))
+                if domain.endswith("bilibili.com") and locator.get("video_part", 1) > 1:
+                    params["p"] = str(locator["video_part"])
+                seek_url = urlunsplit(parts._replace(query=urlencode(params), fragment=""))
+        return {
+            "kind": row["kind"],
+            "label": SEGMENT_LABELS.get(row["kind"], row["kind"]),
+            "text": row["text"],
+            "locator": locator,
+            "url": url,
+            **({"seek_url": seek_url} if seek_url else {}),
+            "archived_at": row["created_at"],
+        }
 
     def _matched_snippets(self, entry_ids: list[str], words: list[str]) -> list[dict[str, Any]]:
         if not words:
@@ -566,6 +666,10 @@ class RecallTools:
         return snippets[:MAX_SNIPPETS]
 
     def _evidence_detail(self, row: sqlite3.Row) -> dict[str, Any]:
+        archive = self.conn.execute(
+            "SELECT status, error_code FROM media_tasks WHERE entry_id=? AND kind IN ('archive','source_body') "
+            "ORDER BY kind DESC LIMIT 1", (row["entry_id"],),
+        ).fetchone()
         return {
             "entry_id": row["entry_id"],
             "source_id": row["source_id"],
@@ -581,4 +685,5 @@ class RecallTools:
             "imported_at": row["imported_at"],
             "last_seen_at": row["last_seen_at"],
             "segments": self._segments(row["entry_id"], None, MAX_EVIDENCE_SEGMENTS),
+            "archive": dict(archive) if archive else {"status": "pending", "error_code": None},
         }
