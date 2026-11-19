@@ -59,11 +59,75 @@ class FollowupTest(unittest.TestCase):
         self.assertNotEqual(moved, profile_dir("Work.github", self.db))
         self.assertNotEqual(moved, profile_dir("work.github", self.db.with_name("another.db")))
 
+    @unittest.skipUnless(importlib.util.find_spec("playwright"), "optional Playwright")
+    def test_platform_login_survives_closing_window_and_reopening_browser(self):
+        from http.cookies import SimpleCookie
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from recall.sources import browser
+
+        received = []
+
+        class Site(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/saved":
+                    received.append(SimpleCookie(self.headers.get("Cookie", "")))
+                self.send_response(200)
+                if self.path == "/login":
+                    self.send_header("Set-Cookie", "session=fixture; HttpOnly; Path=/")
+                    self.send_header("Set-Cookie", "persistent=fixture; HttpOnly; Path=/; Max-Age=600")
+                if self.path == "/renew":
+                    self.send_header("Set-Cookie", "session=renewed; HttpOnly; Path=/")
+                if self.path == "/logout":
+                    self.send_header("Set-Cookie", "session=; HttpOnly; Path=/; Max-Age=0")
+                self.end_headers()
+
+        site = ThreadingHTTPServer(("127.0.0.1", 0), Site)
+        self.addCleanup(site.server_close)
+        threading.Thread(target=site.serve_forever, daemon=True).start()
+        self.addCleanup(site.shutdown)
+        base = f"http://127.0.0.1:{site.server_port}"
+        kind = "bilibili_favorites"
+        self.source(kind=kind)
+        launch = browser._launch
+
+        def close_login_window(playwright, directory, *, headless):
+            context = launch(playwright, directory, headless=headless)
+            context.add_cookies([{"name": "unrelated", "value": "fixture", "url": "https://example.org"}])
+            page = context.pages[0]
+            page.wait_for_timeout = lambda _: page.close()
+            return context
+
+        with patch.dict(browser.PLATFORM_LOGIN, {kind: base + "/login"}), \
+             patch.dict(browser.PLATFORM_START, {kind: base + "/saved"}), \
+             patch.object(browser, "PLATFORM_SESSION_DOMAINS", {kind: ("127.0.0.1",)}, create=True):
+            try:
+                with patch.object(browser, "_launch", side_effect=close_login_window):
+                    browser.connect("s", kind, wait_seconds=1, headless=True, db_path=self.db)
+            except RecallError as exc:
+                if exc.code == "CONFIG_ERROR":
+                    self.skipTest(exc.message)
+                raise
+            for expected, path in (("fixture", "/renew"), ("renewed", "/logout"), (None, None)):
+                session = browser.load_session("s", kind, self.db)
+                try:
+                    self.assertIn("persistent", received[-1])
+                    self.assertNotIn("unrelated", {cookie["name"] for cookie in session._context.cookies()})
+                    cookie = received[-1].get("session")
+                    self.assertEqual(cookie.value if cookie else None, expected)
+                    if path:
+                        session.page.goto(base + path)
+                finally:
+                    session.close()
+
     def test_douyin_identity_requires_observed_self_response(self):
         directory = Path(self.tmp.name)
         (directory / "identity.json").write_text(json.dumps({"user_id": "sec-42"}), encoding="utf-8")
         page = Mock(url="https://www.douyin.com/user/self")
-        session = PlaywrightBrowserSession(page, Mock(), Mock(), directory)
+        session = PlaywrightBrowserSession(page, Mock(), Mock(), directory, "douyin_favorites")
         with self.assertRaises(RecallError) as raised:
             session.identity()
         self.assertEqual(raised.exception.code, "AUTH_REQUIRED")

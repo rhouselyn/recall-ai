@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f4f7f5">
+  <meta name="theme-color" content="#17253b">
   <title>Recall AI · 个人收藏工作台</title>
   <link rel="icon" type="image/svg+xml" href="assets/recall.svg">
   <link rel="stylesheet" href="styles.css">
@@ -17,14 +17,11 @@
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14l4-4m-5.5 6.5-1 1a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0m4 0 1-1a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0" transform="rotate(-8 12 12)"/></symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
-    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4.5 12h14m-6-6 6 6-6 6"/></symbol>
-    <symbol id="i-diagonal" viewBox="0 0 24 24"><path d="M6 18 18 6M8 6h10v10"/></symbol>
     <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.75"/><path d="m15 15 4.5 4.5"/></symbol>
-    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9.5 7h9M9.5 12h9M9.5 17h6m-11-10 1 1 2-2m-3 6 1 1 2-2m-3 6 1 1 2-2"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
-    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5.5" y="10" width="13" height="10" rx="2"/><path d="M8.5 10V7a3.5 3.5 0 0 1 7 0v3m-3.5 4v2"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h14"/><circle cx="9" cy="6" r="2" fill="var(--icon-fill, white)"/><circle cx="15" cy="12" r="2" fill="var(--icon-fill, white)"/><circle cx="10" cy="18" r="2" fill="var(--icon-fill, white)"/></symbol>
     <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 2.6a9.6 9.6 0 0 0-3.04 18.7c.48.08.65-.21.65-.46v-1.8c-2.67.58-3.24-1.13-3.24-1.13-.43-1.11-1.06-1.41-1.06-1.41-.87-.6.06-.58.06-.58.96.07 1.47.98 1.47.98.86 1.47 2.24 1.05 2.79.8.09-.62.34-1.05.62-1.29-2.13-.24-4.37-1.07-4.37-4.74 0-1.05.37-1.9.99-2.57-.1-.24-.43-1.22.09-2.55 0 0 .81-.26 2.64.98a9.2 9.2 0 0 1 4.8 0c1.83-1.24 2.63-.98 2.63-.98.53 1.33.2 2.31.1 2.55.61.67.98 1.52.98 2.57 0 3.68-2.24 4.49-4.38 4.73.35.3.65.88.65 1.78v2.66c0 .26.18.55.66.46A9.6 9.6 0 0 0 12 2.6Z"/></symbol>
     <symbol id="i-chrome" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.6"/><path d="M4.2 7.4 9 14m3-5.6h8.3m-3.6 5.3-4.5 7.2"/></symbol>
     <symbol id="i-bilibili" viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="17" height="12" rx="3"/><path d="m8 4 3 3.5M16 4l-3 3.5M8.5 12.5v2m7-2v2"/></symbol>
@@ -34,16 +31,16 @@
   </svg>
 
   <aside class="sidebar" aria-label="工作区导航">
-    <a class="brand" href="#chat" aria-label="Recall AI 首页">
+    <div class="brand">
       <img src="assets/recall.svg" alt="" width="42" height="42">
       <span><strong>Recall<span> AI</span></strong><small>个人收藏工作台</small></span>
-    </a>
+    </div>
     <button class="new-chat" id="new-chat" type="button"><svg class="icon"><use href="#i-plus"/></svg>新建对话</button>
     <nav class="navigation">
       <button type="button" class="nav-link" data-view="chat" aria-current="page"><svg class="icon"><use href="#i-chat"/></svg>对话</button>
       <button type="button" class="nav-link" data-view="library"><svg class="icon"><use href="#i-bookmark"/></svg>收藏库</button>
       <button type="button" class="nav-link" data-view="accounts"><svg class="icon"><use href="#i-link"/></svg>账号连接</button>
-      <button type="button" class="nav-link" data-view="settings"><svg class="icon"><use href="#i-list"/></svg>设置</button>
+      <button type="button" class="nav-link" data-view="settings"><svg class="icon"><use href="#i-settings"/></svg>设置</button>
     </nav>
     <section class="history" aria-labelledby="history-title">
       <h2 id="history-title">最近对话</h2>
@@ -51,66 +48,34 @@
     </section>
     <div class="sidebar-footer">
       <span class="workspace-icon"><svg class="icon"><use href="#i-lock"/></svg></span>
-      <span><strong>我的工作区</strong><small>个人空间</small></span>
+      <span><strong>本地收藏库</strong><small>收藏保存在这台设备</small></span>
     </div>
   </aside>
 
   <main class="main">
-    <header class="topbar">
-      <div class="breadcrumb"><span>我的工作区</span><svg class="icon"><use href="#i-chevron"/></svg><strong id="current-view">对话</strong></div>
-      <span class="demo-badge"><span aria-hidden="true"></span>本地工作区</span>
-    </header>
-
     <div class="content">
       <section id="view-chat" aria-label="对话">
         <div class="hero">
           <div class="hero-copy">
-            <p class="hero-label"><span aria-hidden="true"></span>Recall AI</p>
-            <h1>把收藏变成知识</h1>
-            <p>找回零散的线索，串成今天用得上的答案。</p>
+            <h1>翻一翻你的收藏</h1>
+            <p>查找保存过的网页、书签和视频，<br>从原文和字幕里找答案。</p>
           </div>
-          <div class="hero-index" aria-hidden="true"><i></i><i></i><i></i></div>
+          <img class="hero-image" src="assets/recall-index.webp" alt="" width="1344" height="896" fetchpriority="high">
         </div>
 
-        <div class="workgrid">
-          <section class="chat-section" aria-labelledby="chat-title">
-            <div class="section-heading">
-              <div><h2 id="chat-title">和收藏对话</h2><p>问一个问题，从你保存过的资料里找线索。</p></div>
-              <span class="quiet-icon" aria-hidden="true"><svg class="icon"><use href="#i-chat"/></svg></span>
+        <section class="chat-section" aria-labelledby="chat-title">
+          <h2 id="chat-title">问问收藏</h2>
+          <div class="messages" id="messages" role="log" aria-live="polite" hidden></div>
+          <form class="composer" id="composer">
+            <label class="sr-only" for="question">输入想问收藏的问题</label>
+            <textarea id="question" rows="2" maxlength="1500" placeholder="问问你的收藏…"></textarea>
+            <div class="composer-footer">
+              <label class="scope"><svg class="icon"><use href="#i-bookmark"/></svg><span class="sr-only">查询范围</span><select id="scope"><option value="">全部收藏</option></select><svg class="icon scope-arrow"><use href="#i-down"/></svg></label>
+              <button type="submit" class="send" aria-label="发送问题" title="发送问题"><svg class="icon"><use href="#i-send"/></svg></button>
             </div>
-            <div class="suggestions" id="suggestions">
-              <button type="button" class="suggestion" data-prompt="我收藏过哪些关于日本市场的资料？">
-                <span class="suggestion-icon"><svg class="icon"><use href="#i-search"/></svg></span>
-                <span><strong>找回资料</strong><small>我收藏过哪些日本市场的资料？</small></span>
-                <svg class="icon hint-arrow"><use href="#i-diagonal"/></svg>
-              </button>
-              <button type="button" class="suggestion" data-prompt="把我收藏的 AI 工具整理成行动清单">
-                <span class="suggestion-icon sand"><svg class="icon"><use href="#i-list"/></svg></span>
-                <span><strong>整理下一步</strong><small>把 AI 工具收藏整理成行动清单</small></span>
-                <svg class="icon hint-arrow"><use href="#i-diagonal"/></svg>
-              </button>
-            </div>
-            <div class="messages" id="messages" role="log" aria-live="polite" hidden></div>
-            <form class="composer" id="composer">
-              <label class="sr-only" for="question">输入想问收藏的问题</label>
-              <textarea id="question" rows="2" maxlength="1500" placeholder="问问你的收藏…"></textarea>
-              <div class="composer-footer">
-                <label class="scope"><svg class="icon"><use href="#i-bookmark"/></svg><span class="sr-only">查询范围</span><select id="scope"><option value="">全部收藏</option></select><svg class="icon scope-arrow"><use href="#i-down"/></svg></label>
-                <button type="submit" class="send" aria-label="发送问题" title="发送问题"><svg class="icon"><use href="#i-send"/></svg></button>
-              </div>
-            </form>
-            <p class="chat-footnote">私密命中默认走本地模型；公开问答可能使用 DeepSeek。点时间戳跳到原视频。</p>
-          </section>
-
-          <aside class="account-panel" aria-labelledby="account-panel-title">
-            <div class="account-panel-head">
-              <div><h2 id="account-panel-title">收藏来源</h2><p id="connection-count"></p></div>
-              <span class="quiet-icon" aria-hidden="true"><svg class="icon"><use href="#i-link"/></svg></span>
-            </div>
-            <div id="account-summary"></div>
-            <button class="panel-action" type="button" data-view="accounts">管理所有账号<svg class="icon"><use href="#i-arrow"/></svg></button>
-          </aside>
-        </div>
+          </form>
+          <p class="chat-footnote" id="chat-note" hidden></p>
+        </section>
       </section>
 
       <section id="view-library" hidden aria-labelledby="library-title">
@@ -139,8 +104,50 @@
       </section>
       <section id="view-settings" hidden aria-labelledby="settings-title">
         <div class="page-heading">
-          <div><h1 id="settings-title">设置</h1><p>把本机收藏库接给其他 Agent。配置只授予读取权限。</p></div>
+          <div><h1 id="settings-title">设置</h1><p>管理问答模型和本机工具连接。</p></div>
+          <span class="page-emblem" aria-hidden="true"><svg class="icon"><use href="#i-settings"/></svg></span>
         </div>
+        <section class="settings-panel" aria-labelledby="model-title">
+          <div class="settings-heading"><div><h2 id="model-title">问答模型</h2><p>保存后立即用于收藏问答。你也可以选择仅检索。</p></div></div>
+          <form id="model-form">
+            <fieldset class="model-options" id="model-options" disabled>
+              <label class="dialog-field">运行方式
+                <select id="model-mode">
+                  <option value="cloud">OpenAI 兼容 API</option>
+                  <option value="ollama">Ollama（本机）</option>
+                  <option value="search">仅检索</option>
+                </select>
+              </label>
+              <div id="model-cloud-fields">
+                <div class="model-fields">
+                  <label class="dialog-field">API 基础地址
+                    <input id="model-url" type="url" required maxlength="2048" placeholder="https://api.deepseek.com" spellcheck="false">
+                  </label>
+                  <label class="dialog-field">模型名称
+                    <input id="model-name" required maxlength="256" placeholder="deepseek-flash" spellcheck="false">
+                  </label>
+                </div>
+                <p class="field-hint">初始值适用于 DeepSeek。其他服务请填写其 OpenAI 兼容地址和模型名称（例如 https://api.openai.com/v1）。</p>
+                <label class="dialog-field">API 密钥
+                  <input id="model-key" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false">
+                </label>
+                <label class="model-private"><input id="model-private" type="checkbox">允许向此服务发送命中的私密收藏和最近对话</label>
+                <p class="field-hint">默认只有公开命中会发往 API。私密命中会尝试使用本机 Ollama。</p>
+              </div>
+              <div id="model-ollama-fields" hidden>
+                <label class="dialog-field">本机模型名称
+                  <input id="model-local-name" maxlength="256" placeholder="留空使用首个本机模型" spellcheck="false">
+                </label>
+                <p class="field-hint">请启动本机 Ollama（127.0.0.1:11434）并下载模型。</p>
+              </div>
+              <div class="settings-actions">
+                <button type="submit" class="primary">保存模型配置</button>
+                <button type="button" class="secondary" id="test-model">测试连接</button>
+              </div>
+            </fieldset>
+            <p class="settings-status" id="model-status" role="status"></p>
+          </form>
+        </section>
         <section class="settings-panel" aria-labelledby="mcp-title">
           <div class="settings-heading"><div><h2 id="mcp-title">MCP · 本机连接</h2><p>把下方 JSON 粘贴到支持 stdio 的 Agent 客户端 MCP 配置。客户端会启动 Recall 的只读工具进程。</p></div></div>
           <fieldset><legend>允许查询的来源</legend><div id="mcp-sources" class="mcp-sources"></div></fieldset>

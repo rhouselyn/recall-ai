@@ -16,3 +16,6 @@ dist/
 *.db-shm
 *.db-journal
 recall-backup*.db
+*.model-settings
+.recall-credential-*
+browser-profiles/

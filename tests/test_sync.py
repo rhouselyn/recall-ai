@@ -66,9 +66,10 @@ class PlatformResponseTest(unittest.TestCase):
 
         page = Mock(url="https://www.xiaohongshu.com/explore")
         page.evaluate.return_value = [{"id": "note", "noteCard": {"displayTitle": "Saved"}}]
-        session = PlaywrightBrowserSession(page, None, None, None)
-        session.identity = Mock(return_value={"user_id": "me"})
-        result = session._xhs_collection({})
+        with tempfile.TemporaryDirectory() as directory:
+            session = PlaywrightBrowserSession(page, None, None, Path(directory), "xiaohongshu_favorites")
+            session.identity = Mock(return_value={"user_id": "me"})
+            result = session._xhs_collection({})
         page.goto.assert_called_once_with("https://www.xiaohongshu.com/user/profile/me?tab=fav&subTab=note",
                                           wait_until="domcontentloaded", timeout=30000)
         self.assertEqual(result["data"]["notes"][0]["note_id"], "note")

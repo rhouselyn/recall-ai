@@ -64,6 +64,81 @@ class WebTestCase(unittest.TestCase):
         self.assertEqual(result["server"]["args"], ["-m", "recall.mcp_server"])
         self.assertEqual(result["server"]["env"], {"RECALL_DB": self.server.db_path})
 
+    def test_model_setup_uses_saved_api_for_chat_and_requires_private_opt_in(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from recall.ingest import add_link
+        from recall.media import archive, tasks
+
+        requests = []
+
+        class ModelHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                requests.append((self.path, self.headers["Authorization"],
+                                 json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"choices":[{"message":{"content":"Saved evidence [1]"}}]}')
+
+        provider = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+        self.addCleanup(provider.server_close)
+        threading.Thread(target=provider.serve_forever, daemon=True).start()
+        self.addCleanup(provider.shutdown)
+        add_link(self.server.db_path, "https://example.com/public", "public", "web",
+                 title="amberstone")
+        add_link(self.server.db_path, "https://example.com/private", "private", "web",
+                 title="bluegranite", access="restricted")
+        bodies = {"public": "Public evidence amberstone", "private": "Private evidence bluegranite"}
+        with patch.object(archive, "enabled", return_value=True):
+            for _ in bodies:
+                outcome = archive.run_archive_tick(self.server.db_path, extractor=lambda url: (
+                    tasks.text_chunks(bodies[url.rsplit("/", 1)[-1]], "article"), None
+                ))
+                self.assertEqual(outcome["status"], "ready")
+        headers = {"X-Recall-Token": self.server.token}
+        settings = {"mode": "cloud", "base_url": f"http://127.0.0.1:{provider.server_port}/v1/chat/completions",
+                    "model": "test-model", "api_key": "test-only-secret"}
+        with patch("recall.web.deepseek_key", return_value=None):
+            self.assertFalse(self.request("/api/session")["model"]["configured"])
+            with self.assertRaises(HTTPError) as denied:
+                self.request("/api/settings/model", settings)
+            self.assertEqual(denied.exception.code, 403)
+            self.assertTrue(self.request("/api/settings/model/test", settings, **headers)["ok"])
+            self.assertEqual(requests[-1][2]["messages"], [{"role": "user", "content": "Reply with OK."}])
+            self.assertFalse(self.server.model_settings_path.exists())
+            saved = self.request("/api/settings/model", settings, **headers)
+            self.assertEqual(saved, self.request("/api/session")["model"])
+            self.assertTrue(saved["has_key"])
+            self.assertNotIn(settings["api_key"], json.dumps(saved))
+            if os.name == "nt":
+                self.assertNotIn(settings["api_key"].encode(), self.server.model_settings_path.read_bytes())
+            else:
+                self.assertEqual(self.server.model_settings_path.stat().st_mode & 0o777, 0o600)
+
+            result = self.request("/api/chat", {"text": "amberstone"}, **headers)
+            self.assertEqual(result["text"], "Saved evidence [1]")
+            path, authorization, payload = requests[-1]
+            self.assertEqual((path, authorization, payload["model"]),
+                             ("/v1/chat/completions", "Bearer test-only-secret", "test-model"))
+            self.assertIn("Public evidence amberstone", payload["messages"][-1]["content"])
+            with patch("recall.models.OLLAMA_URL", f"http://127.0.0.1:{provider.server_port}"):
+                private = self.request("/api/chat", {"text": "bluegranite"}, **headers)
+            self.assertIn("私密收藏", private["text"])
+            self.assertEqual(len(requests), 2)
+
+            with self.assertRaises(HTTPError):
+                self.request("/api/settings/model", {**settings, "base_url": "https://example.org", "api_key": ""}, **headers)
+            self.request("/api/settings/model", {**settings, "allow_private": True, "api_key": ""}, **headers)
+            self.request("/api/chat", {"text": "bluegranite"}, **headers)
+            self.assertIn("Private evidence bluegranite", requests[-1][2]["messages"][-1]["content"])
+            self.request("/api/settings/model", {"mode": "search"}, **headers)
+            result = self.request("/api/chat", {"text": "amberstone"}, **headers)
+            self.assertIn("仅检索", result["text"])
+            self.assertEqual(len(requests), 3)
+
     def test_invalid_post_data_is_reported_without_tracebacks(self):
         import io
         from contextlib import redirect_stderr
@@ -244,12 +319,11 @@ class WebTestCase(unittest.TestCase):
         headers = {"X-Recall-Token": self.server.token}
         with patch.dict(os.environ, {"RECALL_CLOUD_INCLUDE_RESTRICTED": "0"}), \
              patch("recall.web.deepseek_key", return_value="fake"), \
-             patch("recall.web.urllib.request.urlopen") as local, patch("recall.web.urllib.request.build_opener") as cloud:
+             patch("recall.models.urllib.request.build_opener") as backend:
             result = self.request("/api/chat", {"text": "高盛靠的是啥", "history": [{"role": "user", "text": "上句话"}]}, **headers)
         self.assertEqual([item["title"] for item in result["items"]], [title])
         self.assertIn("只拿到标题", result["text"])
-        cloud.assert_not_called()
-        local.assert_not_called()
+        backend.assert_not_called()
 
     @unittest.skipUnless(importlib.util.find_spec("yt_dlp"), "optional video dependency: yt-dlp")
     def test_video_metadata_uses_saved_url_without_downloading(self):
@@ -300,11 +374,12 @@ class WebTestCase(unittest.TestCase):
             self.assertIn(bodies["article"], answer.call_args.args[1][0]["snippets"][0]["text"])
             self.assertEqual(chat["text"], "violetcobalt [1]")
             self.assertEqual(chat["items"][0]["url"], "https://example.com/article")
-            self.assertEqual(answer.call_args.kwargs["key"], "fake")
+            self.assertEqual(answer.call_args.args[3].api_key, "fake")
+            self.assertTrue(answer.call_args.kwargs["use_cloud"])
             with patch.dict(os.environ, {"RECALL_CLOUD_INCLUDE_RESTRICTED": "0"}):
                 private = self.request("/api/chat", {"text": "privatecobalt"}, **headers)
             self.assertEqual(private["items"][0]["title"], "Private")
-            self.assertIsNone(answer.call_args.kwargs["key"])
+            self.assertFalse(answer.call_args.kwargs["use_cloud"])
         with RecallTools.open(self.server.db_path, {"public", "private"}) as tools:
             public = handle_tool_call(tools, "recall_search", {"query": "violetcobalt"})["structuredContent"]
             self.assertEqual(public["items"][0]["snippets"][0]["locator"], {"part": 1})
@@ -314,31 +389,38 @@ class WebTestCase(unittest.TestCase):
 
     def test_answer_sends_archived_evidence_not_untrusted_history(self):
         from unittest.mock import MagicMock
+        from recall.models import ModelSettings
         from recall.web import answer
 
         opener = MagicMock()
         opener.open.return_value.__enter__.return_value.read.return_value = (
             b'{"choices":[{"message":{"content":"violetcobalt [1]"}}]}'
         )
-        with patch("recall.web.urllib.request.build_opener", return_value=opener):
+        with patch("recall.models.urllib.request.build_opener", return_value=opener):
             result = answer("What is the marker?", [{
                 "title": "Article", "snippets": [{"label": "正文", "text": "Marker: violetcobalt",
                                                    "locator": {"part": 1}}],
-            }], [{"role": "assistant", "text": "privatecobalt"}], key="fake")
+            }], [{"role": "assistant", "text": "privatecobalt"}],
+                ModelSettings(mode="cloud", api_key="fake"), use_cloud=True)
         payload = json.loads(opener.open.call_args.args[0].data)
         self.assertIn("Marker: violetcobalt", payload["messages"][-1]["content"])
         self.assertNotIn("privatecobalt", json.dumps(payload))
         self.assertEqual(result, "violetcobalt [1]")
 
     def test_local_answer_labels_single_source_when_model_omits_reference(self):
-        from io import BytesIO
+        from unittest.mock import MagicMock
+        from recall.models import ModelSettings
         from recall.web import answer
 
-        with patch("recall.web.urllib.request.urlopen", side_effect=[
-            BytesIO(b'{"models":[{"name":"local"}]}'),
-            BytesIO(b'{"message":{"content":"The saved note names archivecobalt."}}'),
-        ]):
-            result = answer("Which project?", [{"title": "Note", "snippets": [{"text": "archivecobalt"}]}])
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.side_effect = [
+            b'{"models":[{"name":"remote:cloud"},{"name":"local"}]}',
+            b'{"message":{"content":"The saved note names archivecobalt."}}',
+        ]
+        with patch("recall.models.urllib.request.build_opener", return_value=opener):
+            result = answer("Which project?", [{"title": "Note", "snippets": [{"text": "archivecobalt"}]}],
+                            [], ModelSettings(mode="ollama", model=""))
+        self.assertEqual(json.loads(opener.open.call_args.args[0].data)["model"], "local")
         self.assertTrue(result.endswith("参考原文：[1]"))
 
 

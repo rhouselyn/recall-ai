@@ -8,11 +8,11 @@ const platforms = {
   zhihu: { name: "知乎", mark: "知", data: "本人私密收藏夹" },
   edge: { name: "Microsoft Edge", mark: "e", data: "浏览器收藏夹", browser: true },
 };
-const names = { chat: "对话", library: "收藏库", accounts: "账号连接", settings: "设置" };
 const conversations = [];
 let activeChat = null;
 let currentView = "chat";
 let mcpServer;
+let modelSettings;
 let sources = [];
 let items = [];
 let nextCursor = null;
@@ -102,25 +102,20 @@ async function refreshSources() {
   sources = data.sources;
   sourcesInitialized = true;
   renderAccounts();
+  renderChatNote();
 }
 
 function renderAccounts() {
-  const count = Object.keys(platforms).filter(id => statusFor(sourceFor(id)) === "已连接").length;
-  byId("connection-count").textContent = `${count} / ${Object.keys(platforms).length} 个平台已连接`;
-  byId("account-summary").innerHTML = Object.entries(platforms).slice(0, 5).map(([id, platform]) => `
-    <button type="button" class="summary-row" data-account="${id}">
-      ${platformIcon(id)}<strong>${platform.name}</strong>${connectionStatus(sourceFor(id))}
-    </button>`).join("");
   byId("account-list").innerHTML = Object.entries(platforms).map(([id, platform]) => {
     const source = sourceFor(id);
+    const directLogin = !source && !platform.browser && id !== "github" && id !== "zhihu";
+    const action = directLogin ? "打开登录页" : source ? "管理来源" :
+      platform.browser ? "连接本机书签" : id === "github" ? "接入指南" : "连接选项";
     return `<article class="account-card"><div class="account-card-head">${platformIcon(id)}
       <div><h2>${platform.name}</h2><p>${platform.data}</p></div></div>
       <div class="sync-meta">${connectionStatus(source)}<span>${escapeHtml(syncLabel(source, platform))}</span>
       ${source ? `<span>${source.visible_entry_count} 条 · 上次成功 ${escapeHtml(timeLabel(source.last_success_at))}</span>` : ""}</div>
-      <div class="account-card-footer">
-      ${!platform.browser && id !== "github" && (!source?.last_success_at || source?.sync_state === "needs_login") && source?.sync_state !== "paused"
-        ? `<button type="button" class="primary" data-login="${id}">打开登录页<span class="sr-only"> · ${platform.name}</span></button>` : ""}
-      <button type="button" class="secondary" data-account="${id}">${source ? "管理来源" : platform.browser ? "导入书签" : id === "github" ? "接入指南" : "连接选项"}<span class="sr-only"> ${platform.name}</span></button></div></article>`;
+      <button type="button" class="secondary" data-${directLogin ? "login" : "account"}="${id}">${action}<span class="sr-only"> ${platform.name}</span></button></article>`;
   }).join("");
 }
 
@@ -135,10 +130,70 @@ function renderMcpConfig() {
 
 async function showSettings() {
   const result = await api("/api/settings/mcp");
+  const selected = new Set(Array.from(byId("mcp-sources").querySelectorAll("input:checked"), input => input.value));
   mcpServer = result.server;
   byId("mcp-sources").innerHTML = result.sources.map(id =>
-    `<label><input type="checkbox" value="${escapeHtml(id)}"> ${escapeHtml(id)}</label>`).join("") || "暂无可接入的收藏来源。";
+    `<label><input type="checkbox" value="${escapeHtml(id)}"${selected.has(id) ? " checked" : ""}> ${escapeHtml(id)}</label>`).join("") || "暂无可接入的收藏来源。";
   renderMcpConfig();
+}
+
+function renderChatNote() {
+  if (!modelSettings) return;
+  const hints = [];
+  if (sourcesInitialized && !sources.some(source => source.visible_entry_count > 0)) {
+    hints.push("在「账号连接」同步账号，或到「收藏库」导入书签。");
+  }
+  const notes = { auto: "在「设置」配置问答模型。", search: "", ollama: "问答使用本机 Ollama。",
+    cloud: modelSettings.allow_private ? "公开、私密收藏及近期对话可发往已配置的 API。" :
+      "公开命中使用已配置的 API。私密命中尝试使用本机 Ollama。" };
+  if (notes[modelSettings.mode]) hints.push(notes[modelSettings.mode]);
+  const note = byId("chat-note");
+  note.textContent = hints.join(" ");
+  note.hidden = !hints.length;
+}
+
+function renderModelMode() {
+  const mode = byId("model-mode").value;
+  byId("model-cloud-fields").hidden = mode !== "cloud";
+  byId("model-ollama-fields").hidden = mode !== "ollama";
+  for (const id of ["model-url", "model-name", "model-key", "model-private"]) byId(id).disabled = mode !== "cloud";
+  byId("test-model").hidden = mode === "search";
+}
+
+function useModelSettings(settings) {
+  modelSettings = settings;
+  byId("model-mode").value = settings.mode === "auto" ? "cloud" : settings.mode;
+  byId("model-url").value = settings.base_url;
+  byId("model-name").value = settings.mode === "ollama" ? byId("model-name").placeholder : settings.model;
+  byId("model-local-name").value = settings.mode === "ollama" ? settings.model : "";
+  byId("model-key").value = "";
+  byId("model-key").placeholder = settings.has_key ? "已有密钥，留空继续使用" : "粘贴服务提供的密钥";
+  byId("model-private").checked = settings.allow_private;
+  byId("model-options").disabled = false;
+  renderModelMode();
+  renderChatNote();
+}
+
+async function submitModel(test) {
+  if (!byId("model-form").reportValidity()) return;
+  const mode = byId("model-mode").value;
+  const data = { mode };
+  if (mode === "ollama") data.model = byId("model-local-name").value;
+  if (mode === "cloud") Object.assign(data, { model: byId("model-name").value, base_url: byId("model-url").value,
+    api_key: byId("model-key").value, allow_private: byId("model-private").checked });
+  const panel = byId("model-options");
+  const status = byId("model-status");
+  panel.disabled = true;
+  status.textContent = test ? "正在发送测试消息…" : "正在保存…";
+  status.className = "settings-status";
+  try {
+    const result = await api("/api/settings/model" + (test ? "/test" : ""), data);
+    if (!test) useModelSettings(result);
+    status.textContent = test ? "连接成功。保存配置后即可用于问答。" : "模型配置已保存。";
+  } catch (error) {
+    status.className = "settings-status dialog-error";
+    status.textContent = error.message;
+  } finally { panel.disabled = false; }
 }
 
 async function renderLibrary(append = false) {
@@ -173,16 +228,16 @@ async function renderLibrary(append = false) {
 
 function changeView(view) {
   currentView = view;
-  for (const id of Object.keys(names)) byId(`view-${id}`).hidden = id !== view;
   for (const button of document.querySelectorAll(".nav-link")) {
-    if (button.dataset.view === view) button.setAttribute("aria-current", "page");
+    const active = button.dataset.view === view;
+    byId(`view-${button.dataset.view}`).hidden = !active;
+    if (active) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
-  byId("current-view").textContent = names[view];
   renderHistory();
   if (view === "library") renderLibrary().catch(showError);
   if (view === "accounts") refreshSources().catch(showError);
-  if (view === "settings" && !mcpServer) showSettings().catch(showError);
+  if (view === "settings") showSettings().catch(showError);
   window.scrollTo(0, 0);
 }
 
@@ -212,14 +267,13 @@ function citationSegment(segment, url) {
 
 function renderChat() {
   const turns = activeChat?.turns ?? [];
-  byId("suggestions").hidden = turns.length > 0;
   messages.hidden = turns.length === 0;
   byId("view-chat").classList.toggle("has-turns", turns.length > 0);
   byId("composer").setAttribute("aria-busy", String(Boolean(activeChat?.pending)));
   byId("composer").querySelector(".send").disabled = Boolean(activeChat?.pending);
   messages.replaceChildren(...turns.map(turn => {
     const article = document.createElement("article");
-    article.className = `message ${turn.role}`;
+    article.className = `message ${turn.role}${turn === turns.at(-1) && activeChat.pending ? " pending" : ""}`;
     article.innerHTML = '<p class="message-label"></p><p class="message-body"></p>';
     article.querySelector(".message-label").textContent = turn.role === "user" ? "你" : "Recall AI";
     article.querySelector(".message-body").textContent = turn.text;
@@ -358,13 +412,12 @@ async function showArchivedContent(item, entry, trigger) {
   };
 }
 
-function showImport(kind = "csv") {
+function showImport() {
   openDialog(`<h2 id="dialog-title">导入收藏</h2>
     <p class="dialog-description">导入浏览器导出的书签 HTML，或 Recall 格式的 CSV。</p>
     <label class="dialog-field">文件类型<select id="import-kind"><option value="csv">CSV 清单</option><option value="chrome">Chrome 书签 HTML</option><option value="edge">Edge 收藏 HTML</option></select></label>
     <label class="dialog-field">选择文件<input type="file" id="import-input" accept=".csv,.html,.htm"></label>
     <p class="dialog-error" role="alert"></p><div class="dialog-actions"><button type="button" class="secondary" data-close>取消</button><button type="button" class="primary" id="do-import">导入</button></div>`);
-  byId("import-kind").value = kind;
   byId("do-import").onclick = async event => {
     const button = event.currentTarget;
     const file = byId("import-input").files[0];
@@ -457,12 +510,9 @@ function showAccount(id) {
     <p class="dialog-error" role="alert"></p><div class="dialog-actions">
     ${source && (!platform.browser || (source.source_id === `${id}-local` && source.sync_enabled)) ? `<button class="secondary" type="button" id="pause-account">${source.sync_state === "paused" ? "恢复同步" : "暂停同步"}</button>` : ""}
     ${source && !platform.browser ? '<button class="secondary" type="button" id="sync-account">立即同步</button>' : ""}
-    ${platform.browser ? '<button class="secondary" type="button" id="setup-bookmarks">扩展推送（可选）</button><button class="secondary" type="button" id="import-bookmarks-html">导入 HTML</button>' : ""}
+    ${platform.browser ? '<button class="secondary" type="button" id="setup-bookmarks">扩展推送（可选）</button>' : ""}
     <button class="primary" type="button" id="connect-account">${platform.browser ? (source?.source_id === `${id}-local` && source.sync_enabled && source.sync_state !== "paused" ? "立即扫描" : "启用本机自动扫描") : id === "github" ? "验证并同步" : "打开登录页"}</button></div>`);
-  if (platform.browser) {
-    byId("setup-bookmarks").onclick = () => showBookmarksSetup(id);
-    byId("import-bookmarks-html").onclick = () => showImport(id);
-  }
+  if (platform.browser) byId("setup-bookmarks").onclick = () => showBookmarksSetup(id);
   byId("connect-account").onclick = async event => {
     const button = event.currentTarget;
     button.disabled = true;
@@ -526,7 +576,6 @@ document.addEventListener("click", event => {
   const button = event.target.closest("button");
   if (!button) return;
   if (button.dataset.view) changeView(button.dataset.view);
-  if (button.dataset.prompt) sendQuestion(button.dataset.prompt);
   if (button.dataset.account) showAccount(button.dataset.account);
   if (button.dataset.login) openLoginPages(button, button.dataset.login);
   if (button.id === "login-pending") openLoginPages(button);
@@ -534,7 +583,6 @@ document.addEventListener("click", event => {
   if (button.hasAttribute("data-close")) dialog.close();
   if (button.id === "load-more") renderLibrary(true).catch(showError);
 });
-document.querySelector(".brand").addEventListener("click", event => { event.preventDefault(); changeView("chat"); });
 byId("new-chat").onclick = () => { activeChat = null; question.value = ""; changeView("chat"); renderChat(); question.focus(); };
 byId("composer").onsubmit = event => { event.preventDefault(); sendQuestion(question.value); };
 question.onkeydown = event => {
@@ -550,7 +598,12 @@ byId("library-query").oninput = () => {
 byId("library-source").onchange = () => renderLibrary().catch(showError);
 byId("dialog-close").onclick = () => dialog.close();
 byId("add-link").onclick = showAdd;
-byId("import-file").onclick = () => showImport();
+byId("import-file").onclick = showImport;
+byId("model-mode").onchange = renderModelMode;
+byId("model-url").oninput = () => { byId("model-private").checked = false; };
+byId("model-form").oninput = () => { byId("model-status").textContent = ""; };
+byId("model-form").onsubmit = event => { event.preventDefault(); submitModel(false); };
+byId("test-model").onclick = () => submitModel(true);
 byId("mcp-sources").onchange = renderMcpConfig;
 byId("mcp-private").onchange = renderMcpConfig;
 byId("copy-mcp").onclick = async () => {
@@ -564,7 +617,14 @@ byId("copy-mcp").onclick = async () => {
 };
 
 (async () => {
-  try { const session = await api("/api/session"); sessionToken = session.token; extensionDir = session.extension_dir; archiveEnabled = session.archive_enabled; await refreshSources(); }
+  try {
+    const session = await api("/api/session");
+    sessionToken = session.token;
+    extensionDir = session.extension_dir;
+    archiveEnabled = session.archive_enabled;
+    useModelSettings(session.model);
+    await refreshSources();
+  }
   catch { showToast("请先运行 recall serve，再通过 http://127.0.0.1:8765 打开。"); }
 })();
 setInterval(() => {

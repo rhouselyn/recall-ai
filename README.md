@@ -6,18 +6,18 @@
 
 你的收藏散落在 Chrome 书签、Edge 收藏夹、B 站、知乎、小红书、抖音、YouTube、GitHub Stars……想找的时候，只能挨个平台去翻。
 
-**Recall AI 是一个完全运行在本地的收藏聚合与检索服务**：把各平台的收藏同步/导入到一个本地 SQLite 库，提供统一的全文检索；内置网页工作台；对话接 DeepSeek（或本地 Ollama），你可以用自然语言问「我收藏过的那个讲日本电商的链接是哪个」，它先检索你的收藏，再把相关片段交给模型回答。
+**Recall AI 是一个运行在本机的收藏聚合与检索服务。** 它把各平台的收藏集中到一个 SQLite 库，提供网页工作台和全文检索。你可以直接搜索，也可以接入 OpenAI 兼容 API（如 DeepSeek）或本机 Ollama，让模型根据命中的收藏回答问题。
 
 两个明确的边界：
 
 - **只找你自己的东西**：搜索只覆盖已导入或已同步的数据，不混入平台全站搜索；条目只有元数据时，结果也只是元数据。
-- **收藏存储在本机**：使用 DeepSeek 时，会发送你的问题和命中的非受限收藏片段；使用本地 Ollama 时，问答数据留在本机。
+- **收藏存储在本机**：使用外部模型 API 时，发送你的问题和命中的公开收藏片段。私密收藏和最近对话需在模型设置中另外授权。
 
 ## 功能特性
 
 - **多平台收藏聚合**：Chrome / Edge 书签、GitHub Stars、B 站收藏、知乎收藏（API / 网页两种方式）、小红书、抖音、YouTube（稍后观看 / 喜欢 / 播放列表）、RSS；也支持 CSV 批量导入和单条链接录入
 - **统一检索**：中文分词友好（两字词、`C++`、`%` 都能查），可按来源、平台、收藏夹、保存时间过滤，游标分页
-- **AI 对话**：DeepSeek API 或本地 Ollama；密钥不可用时自动降级为纯本地检索
+- **AI 对话**：网页配置 OpenAI 兼容 API 或本机 Ollama，支持测试连接；也可只用本地检索
 - **本地媒体识别**：图片 OCR、音频/视频转写，片段参与检索（可选组件）
 - **MCP 服务**：暴露四个只读工具，可接入任何支持 MCP 的 AI 客户端（如 Claude Desktop）
 - **浏览器扩展**：Chrome / Edge 书签变动实时同步（Manifest V3 + native messaging）
@@ -26,18 +26,21 @@
 
 ## 快速开始
 
-Windows（首验环境，PowerShell）：
+**Windows** 安装 Python 3.11 或更高版本，克隆仓库后双击 `启动 Recall AI.bat`。第一次运行会联网创建 `.venv`、安装网页功能依赖并打开 [Recall 工作台](http://127.0.0.1:8765/)。保持启动窗口运行。
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[browser,media,archive,semantic,mcp]"
-.\.venv\Scripts\python.exe -m recall init
-.\.venv\Scripts\python.exe -m recall serve
+1. 打开侧栏的 **设置**。选 **OpenAI 兼容 API** 时，填写基础地址、模型名称和 API 密钥，点击 **测试连接**，然后 **保存模型配置**。表单默认填好 DeepSeek 的地址和模型名。使用 Ollama 时，先启动本机服务并下载模型。只需要搜索时选 **仅检索**。
+2. 打开侧栏的 **账号连接**。打开想同步的平台登录页，完成登录后关闭该窗口，Recall 会开始同步。GitHub Stars 使用只读令牌，Chrome / Edge 可以从本机导入。也可以在 **收藏库 → 导入收藏** 上传书签 HTML 或 CSV。
+3. 同步或导入后，在 **收藏库** 搜索，或回 **对话** 提问。正文和字幕会在后台逐步归档。
+
+**macOS / Linux** 在仓库目录运行：
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[browser,archive,semantic,mcp]'
+.venv/bin/python -m recall serve --open
 ```
 
-打开 http://127.0.0.1:8765 即是网页工作台；也可以双击 `启动 Recall AI.bat`。服务运行时会刷新已启用的账号来源，并逐条补全收藏内容。
-
-最短路径：网页里导入一份 Chrome/Edge 书签 HTML，然后在搜索框里搜点什么；或者在「账号连接」里发起平台登录同步。
+账号登录会优先使用已安装的 Chrome，Windows 也可使用 Edge。需要 Playwright 自带的 Chromium 时，使用虚拟环境中的 Python 运行 `python -m playwright install chromium`（Linux 缺少系统依赖时加 `--with-deps`）。
 
 ## 安装
 
@@ -69,8 +72,9 @@ python -m pip install -e ".[media]"    # 需要本地 OCR / ASR
 
 `recall serve`（或双击 `启动 Recall AI.bat`）后访问 http://127.0.0.1:8765：
 
-- **搜索 / 对话**：在标题、摘要和归档片段中检索，回答显示编号来源和命中的片段。有私密命中时默认改用本地 Ollama，不向 DeepSeek 发送问题或私密证据。只有公共命中时可用已配置的 DeepSeek；模型不可用或没有正文时仍显示本地检索结果。
-- **账号连接**：点「一键打开待登录网页」，可同时打开待登录的 B 站、抖音、小红书、知乎和 YouTube 窗口（需本机 Chrome 或 Playwright 安装的 Chromium）。逐个完成扫码或登录并关闭窗口，即会开始同步。通常无需填写用户 ID；知乎只发现网页可见的本人收藏夹，缺失时可补填 `/collection/` 后的数字。
+- **搜索 / 对话**：在标题、摘要和归档片段中检索，回答显示编号来源和命中的片段。有私密命中时默认尝试本机 Ollama。模型不可用或没有正文时仍会显示检索结果。
+- **问答模型**：在「设置」中修改模型后立即生效。API 密钥存入数据库旁的 `*.model-settings` 文件，Windows 由当前用户的 DPAPI 加密，macOS / Linux 文件权限为 `0600`。更换 API 地址需要重新填写密钥。连接测试会发送一条固定测试消息。API 地址和模型名按服务商文档填写。[DeepSeek](https://api-docs.deepseek.com/api/create-chat-completion/) · [OpenAI](https://developers.openai.com/api/reference/resources/chat) · [Ollama](https://docs.ollama.com/api/chat)
+- **账号连接**：点「一键打开待登录网页」，可同时打开待登录的 B 站、抖音、小红书、知乎和 YouTube 窗口。逐个完成扫码或登录并关闭窗口，即会开始同步。通常无需填写用户 ID。知乎只发现网页可见的本人收藏夹，缺失时可补填 `/collection/` 后的数字。
 - **浏览器书签**：在 Chrome 或 Edge 卡片中选择「启用本机自动扫描」，Recall 运行时约每 15 秒检查 Windows 默认资料目录（含 Edge Dev）下的书签文件。不需要扩展，不读取登录会话，也不写回浏览器。扫描只合并，删除和移动不会清除旧记录；需要事件推送和完整快照对账时，可选用扩展。
 - **GitHub Stars**：在 GitHub 卡片打开接入指南，从 GitHub 生成细粒度 PAT，授予只读 `Starring` 和仓库 `Metadata` 权限后粘贴并验证。只会同步当前令牌能访问的仓库。
 
@@ -84,7 +88,7 @@ python -m pip install -e ".[media]"    # 需要本地 OCR / ASR
 - 要在没有字幕时尝试本地转写，安装 `.[media]`、配置 `RECALL_ASR_MODEL_DIR`，设 `RECALL_ARCHIVE_ASR=1` 后重启。仅处理可直接读取、时长不超过 30 分钟且下载不超过 32 MiB 的媒体，优先下载音轨；临时文件随后删除。
 - 入库的正文、字幕、OCR 和转写同时供网页问答、CLI 及 MCP 使用。安装 `.[semantic]` 后，服务会为新旧片段后台补建向量，用 SQLite FTS5 关键词结果与向量结果合并排序，引用仍返回原文和来源定位。尚未取到正文的收藏仍可按标题、摘要等关键词检索。
 - 向量由 FastEmbed 的量化多语言 MiniLM 在本机 CPU 生成，首次约需下载 235 MB 模型；问题、私密内容和向量不会发给模型下载服务。不需要 GPU 或单独的向量数据库。模型未就绪、未安装或通过 `RECALL_SEMANTIC=0` 禁用时，关键词检索仍可用。
-- 登录墙、平台限流、无可读正文或字幕时，原收藏仍保留。当前不处理扫描 PDF 或必须运行脚本渲染的通用页面。设 `RECALL_ARCHIVE=0` 可停用后台网络归档，不删除已有片段。只有明确接受向 DeepSeek 发送受限片段和最近聊天历史时，才设 `RECALL_CLOUD_INCLUDE_RESTRICTED=1`。
+- 登录墙、平台限流、无可读正文或字幕时，原收藏仍保留。当前不处理扫描 PDF 或必须运行脚本渲染的通用页面。设 `RECALL_ARCHIVE=0` 可停用后台网络归档。
 
 ### CLI 导入与查询
 
@@ -135,7 +139,7 @@ recall source pause github-personal
 recall source resume github-personal
 ```
 
-- GitHub 凭据通过 `RECALL_GITHUB_TOKEN` 或网页输入，不进命令参数、SQLite、MCP 配置或日志。Windows 网页输入的 GitHub 令牌用当前用户 DPAPI 加密保存；其他系统暂存于服务进程。DeepSeek 密钥通过 `DEEPSEEK_API_KEY` 配置，也兼容读取已存在的 DPAPI 密钥文件；当前网页没有 DeepSeek 密钥设置入口。
+- GitHub 凭据通过 `RECALL_GITHUB_TOKEN` 或网页输入，不进命令参数、SQLite、MCP 配置或日志。Windows 网页输入的 GitHub 令牌用当前用户 DPAPI 加密保存；其他系统暂存于服务进程。
 - `recall watch` 与手动 `recall sync` 共用同一个租约；GitHub 默认每 90 秒读头部、每 12 小时完整对账。失败按 401 / 账号不匹配 / 限流 / 格式变化分别报告，旧副本继续可查。`--accept-empty` 用于显式接受异常空快照。
 - 服务运行时自动轮询：GitHub 约每 90 秒、YouTube 约每 5 分钟，B 站收藏多时按批次续传、约每 2 分钟刷新。平台未提供推送，是轮询而非即时推送。
 - YouTube 在「账号连接」中登录自己的 Google / YouTube 账号，关闭登录窗口后开始同步；连接器用 yt-dlp 和本机隔离浏览器会话读取稍后观看、喜欢的视频及页面发现的播放列表，按私密数据处理。平台限制、视频不可用或页面变化可能导致部分列表失败；不会因为部分读取失败删除旧收藏。
@@ -143,6 +147,8 @@ recall source resume github-personal
 - 登录浏览器连接器需要先 `recall source connect <id>`，Playwright 为可选依赖。
 
 浏览器资料目录按数据库路径和来源 ID 的哈希隔离（标点、大小写不同的来源不会共用登录）。旧目录只有 `identity.json` 的归属标签完全匹配才自动迁移，否则需要重新连接；抖音必须观察到本人身份响应才能同步，手填 ID 只用于核对。
+
+登录完成后再关闭平台窗口。Recall 在该来源的资料目录中保留平台会话，重新打开工作台或重启服务时会继续使用。Windows 使用当前用户的 DPAPI 加密保存临时会话 Cookie，macOS / Linux 使用权限为 `0600` 的文件。已丢失或被平台撤销的会话需要重新登录。
 
 GitHub 和 B 站全量同步会持久保存分页进度与整轮已见证据，后台下一轮继续；B 站连续两轮完整结果都缺失才停用关系。GitHub 缺失的公开仓库需再次确认可访问才停用，私库或权限不明的旧证据保留并按受限内容处理；这类结果会报告 `MISSING_ENTRY_ACCESS_UNVERIFIED`。知乎首屏轮换已知收藏夹，全量保存夹内位置；仍只声明已读取的子集。
 
@@ -213,13 +219,14 @@ recall source remove old-source --yes
 
 ## 配置参考
 
-所有配置均可省略，按默认行为运行。
+网页保存的模型配置优先于旧 DeepSeek 和 Ollama 环境变量。使用网页工作台时，可以直接在设置中完成模型配置。
 
 | 环境变量 | 说明 |
 | --- | --- |
 | `RECALL_DB` | 数据库文件路径，覆盖默认位置 |
 | `DEEPSEEK_API_KEY` | DeepSeek 对话密钥（也兼容读取已有 Windows DPAPI 密钥文件） |
 | `DEEPSEEK_MODEL` | 对话模型，默认 `deepseek-flash` |
+| `RECALL_CLOUD_INCLUDE_RESTRICTED` | 未保存网页模型配置时，设 `1` 允许旧 DeepSeek 配置发送私密命中和近期对话 |
 | `RECALL_OLLAMA_MODEL` | 本地 Ollama 模型 |
 | `RECALL_GITHUB_TOKEN` | GitHub 只读 PAT（Windows 也可 DPAPI 保存） |
 | `RECALL_ALLOWED_SOURCES` | MCP 暴露的来源白名单，逗号分隔，必填 |

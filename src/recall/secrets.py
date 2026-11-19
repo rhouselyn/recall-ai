@@ -1,9 +1,9 @@
-"""Read the optional DeepSeek key from the environment or Windows DPAPI."""
+"""Local credential storage and compatibility with existing Windows keys."""
 from __future__ import annotations
 
 import ctypes
 import os
-import uuid
+import tempfile
 from pathlib import Path
 
 
@@ -17,17 +17,19 @@ def _secret_path(name: str) -> Path | None:
 
 def load_secret(name: str) -> str | None:
     path = _secret_path(name)
-    if path is None:
-        return None
-    if not path.is_file():
-        return None
+    return read_credential(path) if path is not None else None
+
+
+def read_credential(path: Path) -> str | None:
     try:
+        encrypted = path.read_bytes()
+        if os.name != "nt":
+            return encrypted.decode("utf-8")
         from ctypes import wintypes
 
         class Blob(ctypes.Structure):
             _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
 
-        encrypted = path.read_bytes()
         buffer = ctypes.create_string_buffer(encrypted)
         source = Blob(len(encrypted), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
         output = Blob()
@@ -47,30 +49,41 @@ def save_secret(name: str, value: str) -> bool:
     path = _secret_path(name)
     if path is None:
         return False
+    write_credential(path, value)
+    return True
+
+
+def write_credential(path: Path, value: str) -> None:
+    raw = value.encode("utf-8")
+    data = _encrypt(raw) if os.name == "nt" else raw
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".recall-credential-", delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            file.write(data)
+            file.close()
+            os.replace(temporary, path)
+        finally:
+            file.close()
+            temporary.unlink(missing_ok=True)
+
+
+def _encrypt(raw: bytes) -> bytes:
     from ctypes import wintypes
 
     class Blob(ctypes.Structure):
         _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
 
-    raw = value.encode("utf-8")
     buffer = ctypes.create_string_buffer(raw)
     source = Blob(len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
     output = Blob()
     if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(output)):
         raise OSError("Credential encryption failed")
     try:
-        encrypted = ctypes.string_at(output.data, output.size)
+        return ctypes.string_at(output.data, output.size)
     finally:
         ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
         ctypes.windll.kernel32.LocalFree(output.data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(encrypted)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return True
 
 
 def deepseek_key() -> str | None:

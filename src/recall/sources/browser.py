@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import time
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ from typing import Any
 
 from ..config import resolve_db_path
 from ..errors import RecallError
+from ..secrets import read_credential, write_credential
 
 PLATFORM_START = {
     "zhihu_web": "https://www.zhihu.com/people/me/collections",
@@ -29,6 +31,15 @@ PLATFORM_LOGIN = {
     "bilibili_favorites": "https://passport.bilibili.com/login",
     "youtube_favorites": "https://www.youtube.com/signin?next=%2F",
 }
+PLATFORM_SESSION_DOMAINS = {
+    "zhihu_web": ("zhihu.com",),
+    "bilibili_favorites": ("bilibili.com",),
+    "xiaohongshu_favorites": ("xiaohongshu.com", "rednote.com"),
+    "douyin_favorites": ("douyin.com", "iesdouyin.com"),
+    "youtube_favorites": ("youtube.com", "google.com"),
+}
+SESSION_FILE = "session-cookies"
+logger = logging.getLogger(__name__)
 
 
 def profile_dir(source_id: str, db_path: str | Path | None = None) -> Path:
@@ -60,14 +71,62 @@ def _playwright():
 
 
 def _launch(playwright: Any, directory: Path, *, headless: bool) -> Any:
+    channels = ("chrome", "msedge") if os.name == "nt" else ("chrome",)
+    for channel in channels:
+        try:
+            return playwright.chromium.launch_persistent_context(
+                str(directory), headless=headless, channel=channel
+            )
+        except Exception as exc:
+            if "not found" not in str(exc).lower() and "doesn't exist" not in str(exc).lower():
+                raise
     try:
-        return playwright.chromium.launch_persistent_context(
-            str(directory), headless=headless, channel="chrome"
-        )
-    except Exception as exc:
-        if "not found" not in str(exc).lower() and "doesn't exist" not in str(exc).lower():
-            raise
         return playwright.chromium.launch_persistent_context(str(directory), headless=headless)
+    except Exception as exc:
+        if "executable doesn't exist" in str(exc).lower():
+            raise RecallError("CONFIG_ERROR", "找不到登录浏览器。请安装 Chrome，或运行 python -m playwright install chromium。") from exc
+        raise
+
+
+def _cookie_key(cookie):
+    return (cookie["name"], cookie["domain"], cookie["path"], cookie.get("partitionKey") or "")
+
+
+def _session_cookies(cookies, kind):
+    if not isinstance(cookies, list):
+        return []
+    domains = PLATFORM_SESSION_DOMAINS[kind]
+    selected = []
+    for cookie in cookies:
+        if not isinstance(cookie, dict) or cookie.get("expires") != -1 or not all(
+            isinstance(cookie.get(key), str) for key in ("name", "value", "domain", "path")
+        ):
+            continue
+        host = cookie["domain"].lstrip(".").lower()
+        if any(host == domain or host.endswith("." + domain) for domain in domains):
+            selected.append(cookie)
+    return sorted(selected, key=_cookie_key)
+
+
+def _restore_session_cookies(context, directory, kind):
+    try:
+        cookies = _session_cookies(json.loads(read_credential(directory / SESSION_FILE) or "[]"), kind)
+    except ValueError:
+        return []
+    if cookies:
+        existing = {_cookie_key(cookie) for cookie in context.cookies()}
+        missing = [cookie for cookie in cookies if _cookie_key(cookie) not in existing]
+        if missing:
+            context.add_cookies(missing)
+    return cookies
+
+
+def _save_session_cookies(directory, cookies):
+    path = directory / SESSION_FILE
+    if cookies:
+        write_credential(path, json.dumps(cookies))
+    else:
+        path.unlink(missing_ok=True)
 
 
 def connect(source_id: str, kind: str, **options: Any) -> dict[str, Any]:
@@ -121,9 +180,12 @@ def _connect(
     directory = profile_dir(source_id, db_path)
     directory.mkdir(parents=True, exist_ok=True)
     pw = _playwright()
+    from playwright.sync_api import Error
+
     with pw() as playwright:
         context = _launch(playwright, directory, headless=headless)
         try:
+            saved = _restore_session_cookies(context, directory, kind)
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(PLATFORM_LOGIN.get(kind, PLATFORM_START[kind]),
                       wait_until="domcontentloaded", timeout=30000)
@@ -132,13 +194,20 @@ def _connect(
                 if login.count() == 1 and login.is_visible():
                     login.click(timeout=3000)
             deadline = time.monotonic() + min(max(wait_seconds, 1), 600)
-            while time.monotonic() < deadline and not page.is_closed():
+            # shortcut: checkpoint while the window is open, use response events if final redirects are missed.
+            while not page.is_closed():
                 try:
-                    page.wait_for_timeout(500)
-                except Exception:
-                    if page.is_closed():
+                    current = _session_cookies(context.cookies(), kind)
+                    if current != saved:
+                        _save_session_cookies(directory, current)
+                        saved = current
+                    if time.monotonic() >= deadline:
                         break
-                    raise
+                    page.wait_for_timeout(250)
+                except Error:
+                    if not page.is_closed():
+                        raise
+                    break
             identity = {"user_id": user_id or "", "label": source_id}
             (directory / "identity.json").write_text(
                 json.dumps(identity, ensure_ascii=False), encoding="utf-8"
@@ -149,6 +218,8 @@ def _connect(
                 "identity": identity,
                 "note": "请在浏览器中确认已登录本人账号，随后执行 recall sync。",
             }
+        except OSError as exc:
+            raise RecallError("CONFIG_ERROR", "无法保存登录会话，请检查本机数据目录的写入权限。") from exc
         finally:
             context.close()
 
@@ -163,7 +234,7 @@ def load_session(source_id: str, kind: str, db_path: str | Path | None = None) -
     try:
         context = _launch(playwright, directory, headless=True)
         page = context.pages[0] if context.pages else context.new_page()
-        session = PlaywrightBrowserSession(page, playwright, context, directory)
+        session = PlaywrightBrowserSession(page, playwright, context, directory, kind)
         page.goto(PLATFORM_START[kind], wait_until="domcontentloaded", timeout=30000)
         return session
     except Exception:
@@ -176,11 +247,13 @@ def load_session(source_id: str, kind: str, db_path: str | Path | None = None) -
 class PlaywrightBrowserSession:
     """实现 sources.base.BrowserSession；读取在页面上下文中完成。"""
 
-    def __init__(self, page: Any, playwright: Any, context: Any, directory: Path) -> None:
+    def __init__(self, page: Any, playwright: Any, context: Any, directory: Path, kind: str) -> None:
         self.page = page
         self._playwright = playwright
         self._context = context
         self._directory = directory
+        self._kind = kind
+        self._saved_cookies = _restore_session_cookies(context, directory, kind)
         self._douyin_started = False
         self._xhs_started = False
         self._douyin_identity: dict[str, Any] = {}
@@ -200,10 +273,19 @@ class PlaywrightBrowserSession:
             return
 
     def close(self) -> None:
+        from playwright.sync_api import Error
+
         try:
-            self._context.close()
+            current = _session_cookies(self._context.cookies(), self._kind)
+            if current != self._saved_cookies:
+                _save_session_cookies(self._directory, current)
+        except (Error, OSError):
+            logger.warning("无法更新本机保存的平台登录会话。")
         finally:
-            self._playwright.stop()
+            try:
+                self._context.close()
+            finally:
+                self._playwright.stop()
 
     def youtube_playlists(self) -> tuple[str, list[dict[str, str]]]:
         import hashlib
